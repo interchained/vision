@@ -53,6 +53,10 @@ class DualStore:
         self._sq = sqlite
         self._nd = nedb
 
+        # Limit concurrent fire-and-forget write tasks to prevent httpx
+        # connection pool exhaustion on high-write workloads.
+        self._write_sem = asyncio.Semaphore(8)
+
         # ── Stats counters ────────────────────────────────────────────────
         self._nedb_hits        = 0   # reads served by nedbd
         self._sqlite_fallbacks = 0   # reads that fell back to SQLite
@@ -92,33 +96,34 @@ class DualStore:
     # ── Internal helpers ─────────────────────────────────────────────────
 
     def _fire(self, coro) -> None:
-        """Schedule a nedbd coroutine as a fire-and-forget task."""
+        """Schedule a nedbd coroutine as a semaphore-gated fire-and-forget task."""
         async def _wrap():
-            try:
-                await coro
-                self._write_successes += 1
-                if not self._nedb_online:
-                    self._nedb_online = True
-                    logger.info("DualStore: nedbd reconnected — resuming dual-write")
-            except Exception as e:
-                self._write_failures += 1
-                now = time.monotonic()
-                if self._nedb_online:
-                    self._nedb_online = False
-                    logger.warning(
-                        "DualStore: nedbd write failed — running SQLite-only "
-                        "until nedbd recovers. %s: %s",
-                        type(e).__name__, e or "(no message)"
-                    )
-                    self._last_offline_log = now
-                elif now - self._last_offline_log >= _OFFLINE_WARN_INTERVAL:
-                    logger.warning(
-                        "DualStore: nedbd still unavailable "
-                        "(failures=%d, successes=%d). %s: %s",
-                        self._write_failures, self._write_successes,
-                        type(e).__name__, e or "(no message)",
-                    )
-                    self._last_offline_log = now
+            async with self._write_sem:
+                try:
+                    await coro
+                    self._write_successes += 1
+                    if not self._nedb_online:
+                        self._nedb_online = True
+                        logger.info("DualStore: nedbd reconnected — resuming dual-write")
+                except Exception as e:
+                    self._write_failures += 1
+                    now = time.monotonic()
+                    if self._nedb_online:
+                        self._nedb_online = False
+                        logger.warning(
+                            "DualStore: nedbd write failed — running SQLite-only "
+                            "until nedbd recovers. %s: %s",
+                            type(e).__name__, e or "(no message)"
+                        )
+                        self._last_offline_log = now
+                    elif now - self._last_offline_log >= _OFFLINE_WARN_INTERVAL:
+                        logger.warning(
+                            "DualStore: nedbd still unavailable "
+                            "(failures=%d, successes=%d). %s: %s",
+                            self._write_failures, self._write_successes,
+                            type(e).__name__, e or "(no message)",
+                        )
+                        self._last_offline_log = now
 
         try:
             asyncio.get_running_loop().create_task(_wrap())
