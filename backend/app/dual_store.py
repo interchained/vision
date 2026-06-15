@@ -125,10 +125,14 @@ class DualStore:
         except RuntimeError:
             pass
 
-    async def _nd_read(self, coro) -> Optional[Any]:
-        """Run a nedbd read. Returns None on any failure (fall back to SQLite)."""
+    async def _nd_read(self, coro, timeout: float = 2.0) -> Optional[Any]:
+        """Run a nedbd read with a short timeout.
+
+        Returns None on any failure or timeout so Vision stays fast while
+        nedbd is loading its AOF. Once loaded, reads are sub-millisecond.
+        """
         try:
-            result = await coro
+            result = await asyncio.wait_for(coro, timeout=timeout)
             return result
         except Exception:
             return None
