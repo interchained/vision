@@ -621,17 +621,14 @@ def get_db() -> NedbStore:
 
 
 async def init_db() -> "NedbStore":
-    """Explicitly open the NEDB connection and ensure the database exists."""
-    store = await _ensure_store()
-    # Pre-create the database so the first query doesn't get a 404/400.
-    try:
-        client = await store._get_client()
-        r = await client.get(f"/v1/databases/{store._db}")
-        if r.status_code == 404:
-            await client.post("/v1/databases", json={"name": store._db})
-    except Exception:
-        pass  # non-fatal — queries will handle missing db gracefully
-    return store
+    """Open the NEDB HTTP client (fast — does NOT wait for nedbd to load the DB).
+
+    The database existence check is intentionally skipped here because
+    GET /v1/databases/{name} can block for 30-120s while nedbd replays
+    a large encrypted AOF log. _query() already handles 400/404 gracefully
+    so no pre-check is needed.
+    """
+    return await _ensure_store()
 
 
 async def close_db() -> None:
