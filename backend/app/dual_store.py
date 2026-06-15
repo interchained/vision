@@ -53,27 +53,32 @@ class DualStore:
         self._sq = sqlite
         self._nd = nedb
 
-        # Limit concurrent fire-and-forget write tasks to prevent httpx
-        # connection pool exhaustion on high-write workloads.
-        self._write_sem = asyncio.Semaphore(8)
+        # Max concurrent in-flight nedbd write tasks
+        self._write_sem = asyncio.Semaphore(4)
 
         # ── Stats counters ────────────────────────────────────────────────
-        self._nedb_hits        = 0   # reads served by nedbd
-        self._sqlite_fallbacks = 0   # reads that fell back to SQLite
-        self._write_successes  = 0   # async nedbd writes that completed OK
-        self._write_failures   = 0   # async nedbd writes that failed
-        self._total_reads      = 0   # all read operations attempted
+        self._nedb_hits        = 0
+        self._sqlite_fallbacks = 0
+        self._write_successes  = 0
+        self._write_failures   = 0
+        self._total_reads      = 0
 
-        # ── State ─────────────────────────────────────────────────────────
-        self._nedb_online      = True
-        self._last_offline_log = 0.0
-        self._last_stats_log   = 0
+        # ── Circuit breaker ───────────────────────────────────────────────
+        # When nedbd is down, writes are dropped until a periodic health
+        # probe succeeds. Backoff grows exponentially (10s → 20s → ... → 300s)
+        # so a crashed nedbd doesn't generate continuous noise.
+        self._nedb_online         = True
+        self._consec_failures     = 0       # consecutive failures since last success
+        self._backoff_until       = 0.0     # monotonic time: skip writes until then
+        self._probe_task: Optional[asyncio.Task] = None
+        self._last_offline_log    = 0.0
+        self._last_stats_log      = 0
 
         # Startup banner
         logger.info("=" * 58)
         logger.info("  DualStore ACTIVE")
         logger.info("  Reads : nedbd (sticky) → SQLite fallback")
-        logger.info("  Writes: SQLite (sync) + nedbd (fire-and-forget)")
+        logger.info("  Writes: SQLite (sync) + nedbd (circuit-breaker)")
         logger.info("  nedbd : %s  db=%s", settings.NEDB_URL, settings.NEDB_DB_NAME)
         logger.info("=" * 58)
 

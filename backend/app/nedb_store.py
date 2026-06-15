@@ -170,6 +170,13 @@ class NedbStore:
             f"/v1/databases/{self._db}/put",
             json=payload,
         )
+        if resp.status_code == 404:
+            # Database doesn't exist yet — create it and retry once.
+            await client.post("/v1/databases", json={"name": self._db})
+            resp = await client.post(
+                f"/v1/databases/{self._db}/put",
+                json=payload,
+            )
         resp.raise_for_status()
         return resp.json()
 
@@ -630,14 +637,25 @@ def get_db() -> NedbStore:
 
 
 async def init_db() -> "NedbStore":
-    """Open the NEDB HTTP client (fast — does NOT wait for nedbd to load the DB).
+    """Open the NEDB HTTP client and create the database in the background.
 
-    The database existence check is intentionally skipped here because
-    GET /v1/databases/{name} can block for 30-120s while nedbd replays
-    a large encrypted AOF log. _query() already handles 400/404 gracefully
-    so no pre-check is needed.
+    The database creation is fire-and-forget so startup never blocks.
+    If the database already exists, nedbd returns a non-2xx that we ignore.
     """
-    return await _ensure_store()
+    store = await _ensure_store()
+    # Kick off DB creation as a background task — don't await it.
+    asyncio.get_event_loop().create_task(_ensure_db_exists(store))
+    return store
+
+
+async def _ensure_db_exists(store: "NedbStore") -> None:
+    """POST to create the database. Idempotent — safe if it already exists."""
+    try:
+        client = await store._get_client()
+        await client.post("/v1/databases", json={"name": store._db})
+        # nedbd returns 201 on create, 409/4xx if already exists — both fine.
+    except Exception:
+        pass  # will retry naturally on next write attempt
 
 
 async def close_db() -> None:
