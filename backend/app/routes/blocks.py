@@ -41,6 +41,8 @@ async def list_blocks(
     limit: int = Query(20, ge=1, le=100),
     before_height: int | None = Query(None),
 ):
+    import asyncio
+
     rpc = BlockchainRPC(get_rpc())
     redis = get_redis()
     tip_height_raw = await redis.get(Keys.TIP_HEIGHT)
@@ -48,33 +50,24 @@ async def list_blocks(
 
     end = before_height - 1 if before_height else tip_height
     start = max(0, end - limit + 1)
-    items = []
-    for h in range(end, start - 1, -1):
-        cached_hash = await redis.get(Keys.BLOCK_BY_HEIGHT.format(height=h))
-        if cached_hash:
-            cached = await redis.get(Keys.BLOCK_BY_HASH.format(hash=cached_hash))
-            if cached:
-                b = json.loads(cached)
-                cb = b.get("coinbase") or {}
-                items.append(
-                    {
-                        "height": b["height"],
-                        "hash": b["hash"],
-                        "time": b["time"],
-                        "tx_count": b["n_tx"],
-                        "size": b["size"],
-                        "weight": b.get("weight"),
-                        "miner": cb.get("miner"),
-                        "miner_address": cb.get("address"),
-                    }
-                )
-                continue
-        # Fallback: direct RPC
-        try:
-            bhash = await rpc.get_block_hash(h)
-            block_raw = await rpc.get_block(bhash, verbosity=1)
-            items.append(
-                {
+    heights = list(range(end, start - 1, -1))
+
+    # Fetch all height→hash lookups concurrently instead of sequentially.
+    # Sequential reads through DualStore cost one nedbd round-trip per block
+    # (60+ HTTP calls at limit=30). Gather collapses them in parallel.
+    hashes = await asyncio.gather(
+        *[redis.get(Keys.BLOCK_BY_HEIGHT.format(height=h)) for h in heights],
+        return_exceptions=True,
+    )
+
+    # Fetch full block JSON for whichever heights returned a hash, concurrently.
+    async def _fetch_block_data(h: int, cached_hash):
+        if isinstance(cached_hash, Exception) or not cached_hash:
+            # Fall back to RPC for uncached blocks
+            try:
+                bhash = await rpc.get_block_hash(h)
+                block_raw = await rpc.get_block(bhash, verbosity=1)
+                return {
                     "height": h,
                     "hash": bhash,
                     "time": block_raw.get("time"),
@@ -82,10 +75,48 @@ async def list_blocks(
                     "size": block_raw.get("size"),
                     "weight": block_raw.get("weight"),
                     "miner": None,
+                    "miner_address": None,
                 }
-            )
-        except Exception:
-            continue
+            except Exception:
+                return None
+
+        cached = await redis.get(Keys.BLOCK_BY_HASH.format(hash=cached_hash))
+        if not cached:
+            try:
+                bhash = await rpc.get_block_hash(h)
+                block_raw = await rpc.get_block(bhash, verbosity=1)
+                return {
+                    "height": h,
+                    "hash": bhash,
+                    "time": block_raw.get("time"),
+                    "tx_count": block_raw.get("nTx"),
+                    "size": block_raw.get("size"),
+                    "weight": block_raw.get("weight"),
+                    "miner": None,
+                    "miner_address": None,
+                }
+            except Exception:
+                return None
+
+        b = json.loads(cached)
+        cb = b.get("coinbase") or {}
+        return {
+            "height": b["height"],
+            "hash": b["hash"],
+            "time": b["time"],
+            "tx_count": b["n_tx"],
+            "size": b["size"],
+            "weight": b.get("weight"),
+            "miner": cb.get("miner"),
+            "miner_address": cb.get("address"),
+        }
+
+    results = await asyncio.gather(
+        *[_fetch_block_data(h, hsh) for h, hsh in zip(heights, hashes)],
+        return_exceptions=True,
+    )
+
+    items = [r for r in results if r and not isinstance(r, Exception)]
     return {"items": items, "tip_height": tip_height, "next_before_height": start - 1 if start > 0 else None}
 
 
