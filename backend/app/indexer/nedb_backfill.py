@@ -379,8 +379,9 @@ class NedbBackfillTask:
         current = self.lowest_done - 1
 
         # Semaphore limits concurrent nedbd writes per batch.
-        # With write client read=30s, 16 concurrent writes is safe.
-        _write_sem = asyncio.Semaphore(16)
+        # Keep at 4 until nedb-engine v1.3.0 (sorted indexes) is deployed —
+        # higher concurrency overwhelms the v1.2.x single-threaded Sequencer.
+        _write_sem = asyncio.Semaphore(4)
 
         while not self._stop_event.is_set() and current >= 0:
             batch_written = 0
