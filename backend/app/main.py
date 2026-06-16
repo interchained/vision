@@ -16,7 +16,13 @@ from .indexer.address_index import get_address_indexer
 from .middleware.errors import register_exception_handlers
 from .middleware.rate_limit import rate_limit_middleware
 from . import nedb_store
-from .sqlite_store import close_address_index_writer, close_db, init_address_index_writer, init_db
+from .dual_store import DualStore, set_dual_store_instance
+from .sqlite_store import (
+    close_address_index_writer, close_db,
+    init_address_index_writer, init_db,
+    get_db as _get_sqlite_db,
+    set_store_override,
+)
 from .indexer.nedb_backfill import (
     NedbBackfillTask, SqliteBlockSource, RpcBlockSource,
     get_backfill_task, set_backfill_task,
@@ -71,6 +77,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("init_db failed at startup: %s", e, exc_info=True)
         raise
+
+    # ── DualStore: writes to SQLite (sync) + nedbd (fire-and-forget) ─────
+    # Reads prefer nedbd (sticky), fall back to SQLite.
+    if settings.NEDB_URL:
+        try:
+            await nedb_store.init_db()
+            dual = DualStore(_get_sqlite_db(), nedb_store.get_db())
+            set_store_override(dual)
+            set_dual_store_instance(dual)
+            logger.info(
+                "DualStore active — writes to SQLite + nedbd, reads prefer nedbd "
+                "(url=%s, db=%s)", settings.NEDB_URL, settings.NEDB_DB_NAME
+            )
+        except Exception as e:
+            logger.warning("DualStore init failed (non-fatal — SQLite remains primary): %s", e)
 
     indexer = get_indexer()
     address_indexer = get_address_indexer()
@@ -188,6 +209,13 @@ async def lifespan(app: FastAPI):
     await close_electrumx()
     await close_rpc()
     await close_db()
+    if settings.NEDB_URL:
+        set_store_override(None)
+        set_dual_store_instance(None)
+        try:
+            await nedb_store.close_db()
+        except Exception as e:
+            logger.warning("nedb_store.close_db failed: %s", e)
 
 
 app = FastAPI(

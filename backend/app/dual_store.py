@@ -323,19 +323,17 @@ class DualStore:
         return await self._sq.snapshot_range_exists(start_height, end_height)
 
 
-# ── module-level singleton reference ─────────────────────────────────────────
+# ── module-level singleton ────────────────────────────────────────────────────
 
 _instance: Optional[DualStore] = None
 
 
-def get_dual_store() -> Optional[DualStore]:
-    """Return the active DualStore instance, or None if not initialised.
+def set_dual_store_instance(ds: "DualStore") -> None:
+    """Called by main.py after DualStore is constructed."""
+    global _instance
+    _instance = ds
 
-    Accesses _store_override via the module object (not a cached import)
-    so it always reflects the current value set by set_store_override().
-    """
-    from . import sqlite_store as _sq_mod
-    override = _sq_mod._store_override
-    if isinstance(override, DualStore):
-        return override
-    return None
+
+def get_dual_store() -> Optional["DualStore"]:
+    """Return the active DualStore instance, or None if not initialised."""
+    return _instance
