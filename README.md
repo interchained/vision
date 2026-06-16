@@ -45,7 +45,7 @@ cp .env.example .env  # fill in ITC_RPC_*, ELECTRUMX_*
 # Backend
 cd backend && pip install -r requirements.txt && bash start.sh
 # Frontend
-cd web && npm install && npm run dev
+cd web && pnpm install && pnpm run dev
 ```
 
 ### Docker (production)
