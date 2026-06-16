@@ -254,7 +254,9 @@ class NedbBackfillTask:
 
     async def _write_block(self, block: dict) -> bool:
         height = block.get("height", 0)
-        caused_by = str(height - 1) if height > 0 else None
+        # caused_by must be a list of doc IDs — nedbd does list(caused_by)
+        # so passing a bare string would split it into individual characters.
+        caused_by = [str(height - 1)] if height > 0 else None
         try:
             await self._nd._put(
                 self._collection,
