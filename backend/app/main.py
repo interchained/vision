@@ -151,8 +151,11 @@ async def lifespan(app: FastAPI):
         try:
             from .sqlite_store import get_db as _get_db
             from .rpc.client import get_rpc as _get_rpc
+            # init_db() is idempotent — returns the cached NedbStore singleton
+            # (not the _LazyStore proxy, which lacks _put/_query internals)
+            _nd_store = await nedb_store.init_db()
             _backfill = NedbBackfillTask(
-                nedb=nedb_store.get_db(),
+                nedb=_nd_store,
                 db=settings.NEDB_DB_NAME,
                 sources=[
                     SqliteBlockSource(_get_db()),
