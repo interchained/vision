@@ -5,7 +5,7 @@ became something genuinely new: a live, tamper-evident, time-traveling chain
 explorer powered by a causally-linked append-only database. This document is
 the honest account of what got built, why, and what it now lets you ask.
 
-Built by Mark Allen Evans Jr. (Interchained LLC) and Claude Sonnet 4.6.
+Built by Mark Allen Evans Jr. (Interchained LLC) and Claude Sonnet 4.6 && documentation / spec outline support from ChatGPT 5.5 (thinking).
 
 ---
 
