@@ -89,8 +89,25 @@ class NedbStore:
         self._client_lock = asyncio.Lock()
 
     # ── client management ────────────────────────────────────────────────
+    # Two separate httpx clients with different timeouts:
+    #
+    #   _read_client:  read=3s  — queries fail fast, DualStore falls back to SQLite
+    #   _write_client: read=30s — PUTs wait for nedbd's encrypted AOF fsync
+    #
+    # Root cause of write_errors: a single client with read=3s was timing out
+    # while nedbd fsynced the AOF under write pressure (backfill + DualStore
+    # concurrent writes). Splitting clients removes the contention entirely.
+
+    _write_client: Optional[httpx.AsyncClient] = None
+    _write_client_lock: Optional[asyncio.Lock] = None
+
+    def _ensure_write_lock(self) -> asyncio.Lock:
+        if self._write_client_lock is None:
+            self._write_client_lock = asyncio.Lock()
+        return self._write_client_lock
 
     async def _get_client(self) -> httpx.AsyncClient:
+        """Return the read client (short 3s read timeout)."""
         if self._client is not None:
             return self._client
         async with self._client_lock:
@@ -101,25 +118,35 @@ class NedbStore:
                 self._client = httpx.AsyncClient(
                     base_url=self._base_url,
                     headers=headers,
-                    # Short connect + read timeout so reads fail fast and
-                    # fall back to SQLite. httpx closes sockets cleanly on
-                    # timeout (no BrokenPipe in nedbd, unlike asyncio.wait_for).
-                    timeout=httpx.Timeout(
-                        connect=2.0,
-                        read=3.0,
-                        write=30.0,   # writes need longer — AOF fsync
-                        pool=2.0,
-                    ),
+                    timeout=httpx.Timeout(connect=2.0, read=3.0, write=10.0, pool=2.0),
                 )
         return self._client
 
+    async def _get_write_client(self) -> httpx.AsyncClient:
+        """Return the write client (long 30s read timeout for fsync waits)."""
+        if self._write_client is not None:
+            return self._write_client
+        async with self._ensure_write_lock():
+            if self._write_client is None:
+                headers = {}
+                if self._token:
+                    headers["Authorization"] = f"Bearer {self._token}"
+                self._write_client = httpx.AsyncClient(
+                    base_url=self._base_url,
+                    headers=headers,
+                    timeout=httpx.Timeout(connect=2.0, read=30.0, write=30.0, pool=2.0),
+                )
+        return self._write_client
+
     async def aclose(self) -> None:
-        if self._client is not None:
-            try:
-                await self._client.aclose()
-            except Exception:
-                pass
-            self._client = None
+        for attr in ("_client", "_write_client"):
+            c = getattr(self, attr, None)
+            if c is not None:
+                try:
+                    await c.aclose()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     # ── low-level HTTP helpers ───────────────────────────────────────────
 
@@ -154,7 +181,7 @@ class NedbStore:
         evidence: Optional[str] = None,
         confidence: Optional[float] = None,
     ) -> dict:
-        client = await self._get_client()
+        client = await self._get_write_client()   # write client: 30s read timeout
         payload: dict = {"coll": coll, "id": doc_id, "doc": doc}
         if caused_by is not None:
             payload["caused_by"] = caused_by
@@ -181,7 +208,7 @@ class NedbStore:
         return resp.json()
 
     async def _del(self, coll: str, doc_id: str) -> dict:
-        client = await self._get_client()
+        client = await self._get_write_client()
         resp = await client.delete(
             f"/v1/databases/{self._db}/rows/{coll}/{doc_id}",
         )
@@ -189,7 +216,7 @@ class NedbStore:
         return resp.json()
 
     async def _batch(self, ops: List[dict]) -> dict:
-        client = await self._get_client()
+        client = await self._get_write_client()   # write client
         resp = await client.post(
             f"/v1/databases/{self._db}/batch",
             json={"ops": ops},

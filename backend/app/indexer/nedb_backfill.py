@@ -266,7 +266,13 @@ class NedbBackfillTask:
             )
             return True
         except Exception as e:
-            logger.warning("backfill write h=%d failed: %s", height, e)
+            # Log exception TYPE to prove causality — ReadTimeout means the
+            # response read timed out (nedbd fsync too slow for the 3s read
+            # timeout on a shared client). Fix: write client uses read=30s.
+            logger.warning(
+                "backfill write h=%d failed: %s: %s",
+                height, type(e).__name__, e or "(no message)",
+            )
             self.write_errors += 1
             return False
 
