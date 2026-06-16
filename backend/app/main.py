@@ -182,8 +182,8 @@ async def lifespan(app: FastAPI):
                     SqliteBlockSource(_get_db()),
                     RpcBlockSource(_get_rpc()),
                 ],
-                batch_size=50,
-                sleep_ms=200,
+                batch_size=500,
+                sleep_ms=100,
                 collection="blocks",
             )
             set_backfill_task(_backfill)

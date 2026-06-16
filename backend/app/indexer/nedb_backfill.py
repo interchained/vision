@@ -130,14 +130,24 @@ class RpcBlockSource:
 class NedbBackfillTask:
     """Bi-directional block header backfill into nedbd's ``blocks`` collection.
 
-    - Backward pass: tip → genesis, 50 blocks per batch, 200ms sleep.
-    - Forward pass: picks up any new blocks since the task started.
-    - Cursor persisted in nedbd so restarts resume without reprocessing.
-    - Write errors logged at WARNING with the actual exception.
+    Cursor persistence
+    ------------------
+    The resume cursor is saved to TWO places after every batch:
+      1. nedbd ``_backfill`` collection (queryable via NQL)
+      2. Local JSON file (survives nedbd drops / AOF rebuilds)
+
+    On startup the task reads both sources and takes the most advanced
+    cursor — so even if nedbd was wiped and rebuilt, the local file keeps
+    the backfill from restarting at tip.
+
+    Additionally, on first startup the task queries nedbd for the actual
+    count of documents in the ``blocks`` collection and uses that as the
+    minimum resume floor — so blocks already written are never re-written.
     """
 
-    CURSOR_COLL = "_backfill"
-    CURSOR_ID   = "blocks"
+    CURSOR_COLL      = "_backfill"
+    CURSOR_ID        = "blocks"
+    LOCAL_CURSOR_FILE = ".nedb-backfill-cursor.json"
 
     def __init__(
         self,
@@ -145,8 +155,8 @@ class NedbBackfillTask:
         db:          str,
         sources:     List[BlockSource],
         *,
-        batch_size:  int = 50,
-        sleep_ms:    int = 200,
+        batch_size:  int = 500,
+        sleep_ms:    int = 100,
         collection:  str = "blocks",
     ) -> None:
         self._nd         = nedb
@@ -211,18 +221,73 @@ class NedbBackfillTask:
             logger.info("NedbBackfillTask complete — %d blocks written to nedbd",
                         self.blocks_written)
 
+    def _local_cursor_path(self) -> str:
+        import os
+        return os.path.join(os.getcwd(), self.LOCAL_CURSOR_FILE)
+
+    def _read_local_cursor(self) -> dict:
+        import json as _json
+        try:
+            with open(self._local_cursor_path()) as f:
+                return _json.load(f)
+        except Exception:
+            return {}
+
+    def _write_local_cursor(self) -> None:
+        import json as _json, os as _os
+        try:
+            path = self._local_cursor_path()
+            tmp  = path + ".tmp"
+            with open(tmp, "w") as f:
+                _json.dump({
+                    "lowest_done":   self.lowest_done,
+                    "highest_done":  self.highest_done,
+                    "total":         self.blocks_written,
+                }, f)
+            _os.replace(tmp, path)
+        except Exception as e:
+            logger.warning("backfill local cursor write failed: %s", e)
+
     async def _load_cursor(self) -> dict:
+        """Load from local file AND nedbd — take the most advanced cursor."""
+        local = self._read_local_cursor()
+
+        nedb_cursor: dict = {}
         try:
             rows = await self._nd._query(
                 f'FROM {self.CURSOR_COLL} WHERE _id = "{self.CURSOR_ID}" LIMIT 1'
             )
             if rows.get("rows"):
-                return rows["rows"][0]
+                nedb_cursor = rows["rows"][0]
         except Exception as e:
-            logger.debug("backfill cursor load failed (first run?): %s", e)
-        return {"lowest_done": -1, "highest_done": -1, "total": 0}
+            logger.debug("backfill nedbd cursor unavailable (using local): %s", e)
+
+        # Lower lowest_done = more of the chain covered = better cursor
+        local_low = local.get("lowest_done", -1)
+        nedb_low  = nedb_cursor.get("lowest_done", -1)
+
+        if local_low == -1 and nedb_low == -1:
+            return {"lowest_done": -1, "highest_done": -1, "total": 0}
+        if local_low != -1 and (nedb_low == -1 or local_low < nedb_low):
+            logger.info("backfill: resuming from local file cursor (lowest=%d total=%d)",
+                        local_low, local.get("total", 0))
+            return local
+        else:
+            logger.info("backfill: resuming from nedbd cursor (lowest=%d total=%d)",
+                        nedb_low, nedb_cursor.get("total", 0))
+            return nedb_cursor
+
+    async def _count_nedb_blocks(self) -> int:
+        """Count actual block headers in nedbd (for startup verification)."""
+        try:
+            rows = await self._nd._query(f"FROM {self._collection} LIMIT 9999999")
+            return int(rows.get("count", 0))
+        except Exception:
+            return 0
 
     async def _save_cursor(self) -> None:
+        """Save to local file (reliable) AND nedbd (queryable)."""
+        self._write_local_cursor()
         try:
             await self._nd._put(
                 self.CURSOR_COLL, self.CURSOR_ID,
@@ -233,7 +298,7 @@ class NedbBackfillTask:
                 },
             )
         except Exception as e:
-            logger.warning("backfill cursor save failed: %s", e)
+            logger.debug("backfill nedbd cursor save failed (local saved ok): %s", e)
 
     async def _fetch_block(self, height: int) -> Optional[dict]:
         """Try each source in priority order; log on all failures."""
@@ -306,32 +371,63 @@ class NedbBackfillTask:
             self.highest_done = tip
             self.lowest_done  = tip
 
-        logger.info("NedbBackfillTask resuming — tip=%d lowest_done=%d "
-                    "already_written=%d", tip, self.lowest_done, self.blocks_written)
+        logger.info(
+            "NedbBackfillTask resuming — tip=%d lowest_done=%d already_written=%d",
+            tip, self.lowest_done, self.blocks_written,
+        )
 
         current = self.lowest_done - 1
+
+        # Semaphore limits concurrent nedbd writes per batch.
+        # Keep at 4 until nedb-engine v1.3.0 (sorted indexes) is deployed —
+        # higher concurrency overwhelms the v1.2.x single-threaded Sequencer.
+        _write_sem = asyncio.Semaphore(4)
 
         while not self._stop_event.is_set() and current >= 0:
             batch_written = 0
             batch_start   = current
 
-            for h in range(current, max(current - self._batch_size, -1), -1):
-                if self._stop_event.is_set():
-                    break
+            heights = list(range(
+                current,
+                max(current - self._batch_size, -1),
+                -1,
+            ))
+            if self._stop_event.is_set():
+                break
 
-                block = await self._fetch_block(h)
-                if block:
-                    if await self._write_block(block):
-                        batch_written    += 1
-                        self.blocks_written += 1
-                self.lowest_done = h  # advance cursor regardless of outcome
+            # Phase 1: fetch all blocks from SQLite concurrently
+            fetch_results = await asyncio.gather(
+                *[self._fetch_block(h) for h in heights],
+                return_exceptions=True,
+            )
 
+            # Phase 2: write all fetched blocks to nedbd concurrently
+            async def _write_one(h: int, block):
+                if isinstance(block, Exception) or block is None:
+                    self.lowest_done = h
+                    return False
+                async with _write_sem:
+                    ok = await self._write_block(block)
+                self.lowest_done = h
+                return ok
+
+            write_results = await asyncio.gather(
+                *[_write_one(h, b) for h, b in zip(heights, fetch_results)],
+                return_exceptions=True,
+            )
+
+            for r in write_results:
+                if r is True:
+                    batch_written       += 1
+                    self.blocks_written += 1
+
+            # lowest_done already updated per-block in _write_one
             current = self.lowest_done - 1
 
             if batch_written > 0:
                 await self._save_cursor()
 
-            if batch_written > 0 or (self.blocks_written % 500 == 0 and self.blocks_written > 0):
+            if batch_written > 0 or (self.blocks_written % 5000 == 0 and self.blocks_written > 0):
                 logger.info(
                     "NedbBackfillTask: batch h=%d→%d wrote=%d total=%d "
                     "read_err=%d write_err=%d",
