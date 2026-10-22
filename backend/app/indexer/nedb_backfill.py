@@ -401,31 +401,44 @@ class NedbBackfillTask:
                 return_exceptions=True,
             )
 
-            # Phase 2: write all fetched blocks to nedbd concurrently
+            # Phase 2: write all fetched blocks to nedbd concurrently.
+            # _write_one must NOT touch lowest_done: gather() finishes in
+            # completion order, not height order, so per-task assignment
+            # left the cursor at whichever height finished last — and it
+            # assigned on fetch/write failure too, marking blocks that
+            # were never written as done and leaving permanent holes
+            # below the cursor that no later pass revisits.
             async def _write_one(h: int, block):
                 if isinstance(block, Exception) or block is None:
-                    self.lowest_done = h
                     return False
                 async with _write_sem:
-                    ok = await self._write_block(block)
-                self.lowest_done = h
-                return ok
+                    return await self._write_block(block)
 
             write_results = await asyncio.gather(
                 *[_write_one(h, b) for h, b in zip(heights, fetch_results)],
                 return_exceptions=True,
             )
 
-            for r in write_results:
-                if r is True:
-                    batch_written       += 1
-                    self.blocks_written += 1
+            # Advance the cursor only over the contiguous run of
+            # successes from the top of the (descending) batch down, and
+            # count only that run. Stop at the first failure: lowest_done
+            # stays one above it, so the next batch retries from exactly
+            # that height. Blocks below a hole were written, but they are
+            # re-put (idempotent) and counted when the retry passes them.
+            for h, r in zip(heights, write_results):
+                if r is not True:
+                    logger.warning("backfill retrying from failed height %d", h)
+                    break
+                self.lowest_done = h
+                batch_written       += 1
+                self.blocks_written += 1
 
-            # lowest_done already updated per-block in _write_one
             current = self.lowest_done - 1
 
-            if batch_written > 0:
+            if batch_written:
                 await self._save_cursor()
+            if batch_written < len(heights):
+                await asyncio.sleep(max(self._sleep_s, 1.0))
 
             if batch_written > 0 or (self.blocks_written % 5000 == 0 and self.blocks_written > 0):
                 logger.info(

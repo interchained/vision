@@ -42,6 +42,31 @@ _STATS_LOG_INTERVAL = 1_000
 # Log nedbd-offline warning at most once every this many seconds
 _OFFLINE_WARN_INTERVAL = 60
 
+# ── Control keys ─────────────────────────────────────────────────────────
+# Mutable progress/status pointers must NEVER be served from nedbd.
+#
+# DualStore nedbd writes are fire-and-forget tasks gated by a small
+# semaphore, queued behind thousands of block-KV puts per indexer batch.
+# They can lag, be dropped by the circuit breaker, or land out of order.
+# A sticky nedbd read of one of these keys therefore returns a stale
+# value indefinitely — e.g. the block loop reading an old
+# ``vision:indexer:last_height`` re-fetches and re-stores the same batch
+# forever (observed in production: Sync pinned at 525090, 0.0 blk/s,
+# while the address index — whose pointer bypasses DualStore — advanced
+# normally, and ``vision:tip:height`` stayed frozen for the address loop).
+#
+# Control keys are SQLite-only in both directions. NEDB remains the
+# historical/query copy for block *data*; it is not a progress register.
+_CONTROL_PREFIXES = (
+    "vision:tip:",             # tip height / hash / block
+    "vision:indexer:",         # indexer last_height / status
+    "vision:address_index:",   # address index last_height / status
+)
+
+
+def _is_control_key(key: Any) -> bool:
+    return isinstance(key, str) and key.startswith(_CONTROL_PREFIXES)
+
 
 class DualStore:
     """Bi-directional dual-write store — SQLite primary, nedbd secondary.
@@ -172,6 +197,10 @@ class DualStore:
     # ── key / value ──────────────────────────────────────────────────────
 
     async def get(self, key: str) -> Optional[str]:
+        if _is_control_key(key):
+            result = await self._sq.get(key)
+            self._record_read(from_nedb=False)
+            return result
         val = await self._nd_read(self._nd.get(key))
         if val is not None:
             self._record_read(from_nedb=True)
@@ -182,21 +211,26 @@ class DualStore:
 
     async def set(self, key: str, value: Any, ex: Optional[int] = None) -> None:
         await self._sq.set(key, value, ex)
-        self._fire(self._nd.set(key, value, ex))
+        if not _is_control_key(key):
+            self._fire(self._nd.set(key, value, ex))
 
     async def delete(self, *keys: str) -> int:
         count = await self._sq.delete(*keys)
-        self._fire(self._nd.delete(*keys))
+        data_keys = tuple(k for k in keys if not _is_control_key(k))
+        if data_keys:
+            self._fire(self._nd.delete(*data_keys))
         return count
 
     async def incr(self, key: str) -> int:
         val = await self._sq.incr(key)
-        self._fire(self._nd.set(key, str(val)))
+        if not _is_control_key(key):
+            self._fire(self._nd.set(key, str(val)))
         return val
 
     async def expire(self, key: str, seconds: int) -> None:
         await self._sq.expire(key, seconds)
-        self._fire(self._nd.expire(key, seconds))
+        if not _is_control_key(key):
+            self._fire(self._nd.expire(key, seconds))
 
     # ── sorted sets ──────────────────────────────────────────────────────
 
