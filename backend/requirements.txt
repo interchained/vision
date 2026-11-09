@@ -14,3 +14,6 @@ slowapi==0.1.9
 python-multipart==0.0.12
 feedgen==1.0.0
 Pillow==10.4.0
+
+# Embedded NEDB engine (KV layer — replaces the nedbd HTTP hop)
+nedb-engine==15.15.15

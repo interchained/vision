@@ -16,15 +16,18 @@ from .indexer.address_index import get_address_indexer
 from .middleware.errors import register_exception_handlers
 from .middleware.rate_limit import rate_limit_middleware
 from . import nedb_store
-from .dual_store import DualStore, set_dual_store_instance
+from .embedded_store import (
+    EmbeddedNedbStore, EmbeddedStore, set_embedded_store_instance,
+)
 from .sqlite_store import (
     close_address_index_writer, close_db,
     init_address_index_writer, init_db,
     get_db as _get_sqlite_db,
     set_store_override,
 )
-from .indexer.nedb_backfill import (
-    NedbBackfillTask, SqliteBlockSource, RpcBlockSource,
+from .indexer.embedded_backfill import (
+    EmbeddedBackfillTask, HttpKvBlockSource, SqliteKvBlockSource,
+    RpcLiteBlockSource, seed_tip_window,
     get_backfill_task, set_backfill_task,
 )
 from .routes import (
@@ -78,23 +81,9 @@ async def lifespan(app: FastAPI):
         logger.error("init_db failed at startup: %s", e, exc_info=True)
         raise
 
-    # ── DualStore: writes to SQLite (sync) + nedbd (fire-and-forget) ─────
-    # Reads prefer nedbd (sticky), fall back to SQLite.
-    if settings.NEDB_URL:
-        try:
-            await nedb_store.init_db()
-            dual = DualStore(_get_sqlite_db(), nedb_store.get_db())
-            set_store_override(dual)
-            set_dual_store_instance(dual)
-            logger.info(
-                "DualStore active — writes to SQLite + nedbd, reads prefer nedbd "
-                "(url=%s, db=%s)", settings.NEDB_URL, settings.NEDB_DB_NAME
-            )
-        except Exception as e:
-            logger.warning("DualStore init failed (non-fatal — SQLite remains primary): %s", e)
-
     indexer = get_indexer()
     address_indexer = get_address_indexer()
+    lifespan_embedded: list = []
 
     async def _deferred_start():
         """Run after uvicorn is already accepting connections.
@@ -104,6 +93,51 @@ async def lifespan(app: FastAPI):
         """
         await asyncio.sleep(1)  # Let uvicorn settle
         logger.info("Deferred startup: begin")
+
+        # 0. Embedded NEDB store — the KV layer lives in-process now.
+        #    Open it, install it as the get_db() override, seed the tip
+        #    window from SQLite so the explorer serves live data
+        #    immediately, then start the backwards history sync.
+        if settings.STORE_MODE == "embedded":
+            try:
+                sqlite = _get_sqlite_db()   # capture BEFORE override
+                embedded = EmbeddedNedbStore(settings.NEDB_EMBEDDED_DIR)
+                await embedded.open()
+                store = EmbeddedStore(sqlite, embedded)
+                set_store_override(store)
+                set_embedded_store_instance(store)
+                lifespan_embedded.append(embedded)
+
+                seed = await seed_tip_window(sqlite, embedded)
+                sources: list = []
+                if settings.NEDB_URL:
+                    try:
+                        await nedb_store.init_db()
+                        sources.append(HttpKvBlockSource(nedb_store.get_db()))
+                    except Exception as e:
+                        logger.warning(
+                            "Legacy nedbd backfill source unavailable "
+                            "(non-fatal): %s", e,
+                        )
+                sources.append(SqliteKvBlockSource(sqlite))
+                try:
+                    from .rpc.client import get_rpc as _get_rpc
+                    sources.append(RpcLiteBlockSource(_get_rpc()))
+                except Exception:
+                    pass
+                backfill = EmbeddedBackfillTask(embedded, sources)
+                set_backfill_task(backfill)
+                await backfill.start()
+                logger.info(
+                    "Embedded store ACTIVE — KV in-process at %s "
+                    "(tip=%d, seeded=%d, history sync running)",
+                    settings.NEDB_EMBEDDED_DIR, seed["tip"], seed["seeded"],
+                )
+            except Exception as e:
+                logger.error(
+                    "Embedded store init failed (non-fatal — SQLite "
+                    "keeps serving): %s", e, exc_info=True,
+                )
 
         # 1. ElectrumX first — its handshake is independent of the DB
         try:
@@ -165,33 +199,6 @@ async def lifespan(app: FastAPI):
 
     _background_tasks.append(asyncio.create_task(webhooks.webhook_dispatcher_loop()))
 
-    # ── NEDB bi-directional backfill (tip → genesis) ──────────────────────
-    # Runs only when NEDB_URL is configured. Uses SQLite cache as primary
-    # source (fast, no RPC), falls back to live RPC for missing blocks.
-    if settings.NEDB_URL:
-        try:
-            from .sqlite_store import get_db as _get_db
-            from .rpc.client import get_rpc as _get_rpc
-            # init_db() is idempotent — returns the cached NedbStore singleton
-            # (not the _LazyStore proxy, which lacks _put/_query internals)
-            _nd_store = await nedb_store.init_db()
-            _backfill = NedbBackfillTask(
-                nedb=_nd_store,
-                db=settings.NEDB_DB_NAME,
-                sources=[
-                    SqliteBlockSource(_get_db()),
-                    RpcBlockSource(_get_rpc()),
-                ],
-                batch_size=500,
-                sleep_ms=100,
-                collection="blocks",
-            )
-            set_backfill_task(_backfill)
-            await _backfill.start()
-            logger.info("NedbBackfillTask started (tip→genesis + forward sync)")
-        except Exception as e:
-            logger.warning("NedbBackfillTask failed to start (non-fatal): %s", e)
-
     yield
 
     logger.info("Vision backend stopping")
@@ -209,9 +216,15 @@ async def lifespan(app: FastAPI):
     await close_electrumx()
     await close_rpc()
     await close_db()
-    if settings.NEDB_URL:
+    if lifespan_embedded:
         set_store_override(None)
-        set_dual_store_instance(None)
+        set_embedded_store_instance(None)
+        for _emb in lifespan_embedded:
+            try:
+                await _emb.aclose()
+            except Exception as e:
+                logger.warning("embedded store close failed: %s", e)
+    if settings.NEDB_URL:
         try:
             await nedb_store.close_db()
         except Exception as e:
