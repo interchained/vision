@@ -41,7 +41,7 @@ export default function MempoolPage() {
 
   useEffect(() => {
     load();
-    const i = setInterval(load, 8000);
+    const i = setInterval(load, 5000);
     return () => clearInterval(i);
   }, []);
 

@@ -29,6 +29,10 @@ export function RecentBlocks({ limit = 12 }: { limit?: number }) {
 
   useEffect(() => {
     load();
+    // SSE block events are the primary trigger; this poll is the floor
+    // that keeps the list live even if the event stream is interrupted.
+    const i = setInterval(load, 5000);
+    return () => clearInterval(i);
   }, [limit]);
 
   useSse((ev) => {

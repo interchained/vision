@@ -49,7 +49,7 @@ export function NodeSyncingBanner() {
       }
     };
     check();
-    const t = setInterval(check, 10_000);
+    const t = setInterval(check, 2_000);
     return () => {
       cancelled = true;
       clearInterval(t);
