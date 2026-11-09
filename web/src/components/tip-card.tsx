@@ -54,7 +54,7 @@ export function TipCard() {
     };
 
     load();
-    const i = setInterval(load, 10_000);
+    const i = setInterval(load, 5_000);
     return () => {
       clearInterval(i);
       clearTimeout(retryRef.current);

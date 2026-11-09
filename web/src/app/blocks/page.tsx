@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { formatNumber, humanBytes, shortHash, timeAgo } from '@/lib/utils';
 import { Sk, SKELETON_ROWS } from '@/components/skeleton';
@@ -29,7 +29,17 @@ export default function BlocksPage() {
     }
   };
 
-  useEffect(() => { load(); }, []);
+  // Poll the head of the chain every 5s so the page stays live; once
+  // the user pages into history ("Load older") the poll pauses so
+  // their view doesn't shift under them.
+  const paginatedRef = useRef(false);
+  useEffect(() => {
+    load();
+    const i = setInterval(() => {
+      if (!paginatedRef.current) load();
+    }, 5000);
+    return () => clearInterval(i);
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -95,7 +105,7 @@ export default function BlocksPage() {
       {nextBefore !== null && nextBefore > 0 && !loading && (
         <div className="text-center">
           <button
-            onClick={() => load(nextBefore)}
+            onClick={() => { paginatedRef.current = true; load(nextBefore); }}
             disabled={loadingMore}
             className="px-5 py-2.5 bg-[var(--color-surface)] border border-[var(--color-border)] hover:border-[var(--color-accent)] disabled:opacity-50 rounded-lg text-sm transition"
           >

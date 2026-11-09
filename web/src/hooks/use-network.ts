@@ -22,21 +22,32 @@ export function useNetwork() {
   const [tipUpdated, setTipUpdated] = useState(0);
 
   useEffect(() => {
-    const load = async () => {
-      const [statsResult, priceResult, supplyResult] = await Promise.allSettled([
+    // Fast lane: network stats + price every 5s so the dashboard and
+    // footer feel live. Supply stays on its own slow cadence — it can
+    // ride on an uncached gettxoutsetinfo and must not gate the rest.
+    const loadFast = async () => {
+      const [statsResult, priceResult] = await Promise.allSettled([
         withTimeout(vision.getNetworkStats(), 8000),
         withTimeout(vision.getPrice(), 8000),
-        // Supply may take longer if gettxoutsetinfo is uncached
-        withTimeout(api.supply(), 65000),
       ]);
       if (statsResult.status === 'fulfilled') setStats(statsResult.value);
       if (priceResult.status === 'fulfilled') setPrice(priceResult.value);
-      if (supplyResult.status === 'fulfilled') setSupply(supplyResult.value);
       setLoading(false);
     };
-    load();
-    const i = setInterval(load, 30000);
-    return () => clearInterval(i);
+    const loadSupply = async () => {
+      const [supplyResult] = await Promise.allSettled([
+        withTimeout(api.supply(), 65000),
+      ]);
+      if (supplyResult.status === 'fulfilled') setSupply(supplyResult.value);
+    };
+    loadFast();
+    loadSupply();
+    const fast = setInterval(loadFast, 5000);
+    const slow = setInterval(loadSupply, 60000);
+    return () => {
+      clearInterval(fast);
+      clearInterval(slow);
+    };
   }, []);
 
   useSse((ev) => {
