@@ -11,10 +11,12 @@ The serving model (replaces the DualStore + NedbBackfillTask design):
    checkpoint down to genesis, copying each block's KV docs
    (``BLOCK_BY_HEIGHT`` / ``BLOCK_BY_HASH`` / ``RECENT_BLOCKS`` —
    exactly the writes the block indexer makes per block) into the
-   embedded store. Sources, in order: the legacy nedbd HTTP store
-   (the data already lives there from the DualStore era), SQLite's
-   KV cache (always complete, local), and finally live RPC in the
-   indexer's own "lite" serialization.
+   embedded store. Sources, in order: SQLite's KV cache (always
+   complete, local, byte-identical docs), the legacy nedbd HTTP
+   store (the data also lives there from the DualStore era, but it
+   is a remote round-trip per block — as primary source it throttled
+   the production descent to ~100 blocks/min), and finally live RPC
+   in the indexer's own "lite" serialization.
 3. **Progress is public.** The contiguous synced floor
    (``vision:sync:lowest_synced``) lives in the embedded store and is
    surfaced via /api/health, so the UI can show sync progress and
