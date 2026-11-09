@@ -61,13 +61,19 @@ def health():
     except Exception:
         electrum_ok = False
 
-    # DualStore stats (nedbd primary chain)
-    dual_stats: dict = {"active": False}
+    # Embedded-store sync progress — tip checkpoint + backwards
+    # history sync. Read from an in-memory cache the backfill task
+    # publishes to, so this endpoint stays fully synchronous.
+    sync_stats: dict = {"active": False}
     try:
-        from ..dual_store import get_dual_store
-        ds = get_dual_store()
-        if ds is not None:
-            dual_stats = ds.stats()
+        from ..embedded_store import get_embedded_store
+        from ..indexer.embedded_backfill import get_sync_status
+        if get_embedded_store() is not None:
+            sync_stats = {
+                "active": True,
+                "store": "embedded",
+                **get_sync_status(),
+            }
     except Exception:
         pass
 
@@ -80,5 +86,5 @@ def health():
         "db":             db_ok,
         "indexer_height": indexer_height,
         "version":        __version__,
-        "dual_store":     dual_stats,
+        "sync":           sync_stats,
     }

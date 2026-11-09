@@ -146,7 +146,21 @@ async def get_block(id: str):
 
     cached = await redis.get(Keys.BLOCK_BY_HASH.format(hash=bhash))
     if cached:
-        return json.loads(cached)
+        doc = json.loads(cached)
+        try:
+            return Block.model_validate(doc)
+        except Exception:
+            # Lite-shaped cache docs (written while the indexer was
+            # catching up) lack version_hex. It's derivable from
+            # version — fill it in instead of re-fetching the block.
+            if isinstance(doc, dict) and "version" in doc:
+                doc.setdefault(
+                    "version_hex", f"{int(doc['version']):08x}")
+                try:
+                    return Block.model_validate(doc)
+                except Exception:
+                    pass
+        # Unusable cache shape — fall through to the RPC shaping path.
 
     try:
         block_raw = await rpc.get_block(bhash, verbosity=2)

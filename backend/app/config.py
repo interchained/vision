@@ -71,9 +71,19 @@ class Settings(BaseSettings):
     # ── SQLite (replaces Redis) ──
     SQLITE_DB_PATH: str = "../data/vision.db"
 
-    # ── NEDB (optional — when set, replaces SQLite for the KV layer) ──
-    # NEDB_URL empty = use SQLite. When set to e.g. "http://127.0.0.1:7070"
-    # the lifespan startup wires the KV layer through nedbd instead.
+    # ── KV store ──
+    # STORE_MODE "embedded" (default): the KV layer is served by an
+    # in-process embedded NEDB engine on NEDB_EMBEDDED_DIR — no HTTP
+    # hop, no separate nedbd process in the serving path. "sqlite"
+    # keeps the legacy behaviour (KV on SQLiteStore directly).
+    STORE_MODE: str = "embedded"
+    NEDB_EMBEDDED_DIR: str = "../data/vision-embedded"
+
+    # ── NEDB over HTTP (legacy — backfill source only) ──
+    # When NEDB_URL is set (e.g. "http://127.0.0.1:7070"), the
+    # one-time backwards history sync prefers copying block KV docs
+    # from the old nedbd store before falling back to SQLite / RPC.
+    # It is never used for serving reads or writes any more.
     NEDB_URL: str = ""
     NEDB_DB_NAME: str = "vision"
     NEDBD_TOKEN: str = ""
