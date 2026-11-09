@@ -1,6 +1,7 @@
 import { TipCard } from '@/components/tip-card';
 import { RecentBlocks } from '@/components/recent-blocks';
 import { NetworkHealth } from '@/components/network-health';
+import { PowAlgos } from '@/components/pow-algos';
 import { RecentTxs } from '@/components/recent-txs';
 import { AddressWatchlist } from '@/components/address-watchlist';
 
@@ -18,6 +19,8 @@ export default function HomePage() {
         </div>
         <NetworkHealth />
       </section>
+
+      <PowAlgos />
 
       <section className="grid lg:grid-cols-3 gap-6">
         <div className="lg:col-span-1 flex flex-col gap-6">

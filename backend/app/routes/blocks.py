@@ -9,6 +9,7 @@ from ..sqlite_store import Keys, get_db as get_redis
 from ..rpc.client import get_rpc, RPCConnectionError, RPCError
 from ..rpc.methods import BlockchainRPC
 from ..services.blocks import shape_block
+from ..utils.pow import algo_for_block
 
 router = APIRouter()
 
@@ -74,6 +75,7 @@ async def list_blocks(
                     "tx_count": block_raw.get("nTx"),
                     "size": block_raw.get("size"),
                     "weight": block_raw.get("weight"),
+                    "algo": algo_for_block(block_raw.get("version", 0), h),
                     "miner": None,
                     "miner_address": None,
                 }
@@ -92,6 +94,7 @@ async def list_blocks(
                     "tx_count": block_raw.get("nTx"),
                     "size": block_raw.get("size"),
                     "weight": block_raw.get("weight"),
+                    "algo": algo_for_block(block_raw.get("version", 0), h),
                     "miner": None,
                     "miner_address": None,
                 }
@@ -107,6 +110,7 @@ async def list_blocks(
             "tx_count": b["n_tx"],
             "size": b["size"],
             "weight": b.get("weight"),
+            "algo": algo_for_block(b.get("version", 0), b["height"]),
             "miner": cb.get("miner"),
             "miner_address": cb.get("address"),
         }

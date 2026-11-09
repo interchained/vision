@@ -6,6 +6,7 @@ import { api } from '@/lib/api';
 import { useSse } from '@/lib/sse';
 import { formatNumber, humanBytes, shortHash, timeAgo } from '@/lib/utils';
 import { Sk, SKELETON_ROWS } from './skeleton';
+import { AlgoBadge } from './algo-badge';
 import { NodeSyncingInline } from './node-syncing';
 import { useSyncState } from '@/hooks/use-sync';
 
@@ -71,6 +72,7 @@ export function RecentBlocks({ limit = 12 }: { limit?: number }) {
           >
             <div className="flex items-center gap-4">
               <span className="text-base mono font-semibold text-[var(--color-gold)] min-w-[80px]">#{formatNumber(b.height)}</span>
+              <AlgoBadge algo={b.algo} className="hidden sm:inline-flex" />
               <span className="hidden sm:inline text-xs text-[var(--color-text-faint)] mono">{shortHash(b.hash)}</span>
             </div>
             <div className="flex items-center gap-4 text-xs text-[var(--color-text-dim)] mono">
