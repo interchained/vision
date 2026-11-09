@@ -109,7 +109,13 @@ async def lifespan(app: FastAPI):
                 lifespan_embedded.append(embedded)
 
                 seed = await seed_tip_window(sqlite, embedded)
-                sources: list = []
+                # Source order: SQLite first — its KV cache is local,
+                # complete, and holds byte-identical docs. The legacy
+                # nedbd HTTP store is a remote round-trip per block
+                # through a thin connection pool; as primary source it
+                # throttled the descent to ~100 blocks/min in
+                # production. It stays as a fallback, then RPC.
+                sources: list = [SqliteKvBlockSource(sqlite)]
                 if settings.NEDB_URL:
                     try:
                         await nedb_store.init_db()
@@ -119,7 +125,6 @@ async def lifespan(app: FastAPI):
                             "Legacy nedbd backfill source unavailable "
                             "(non-fatal): %s", e,
                         )
-                sources.append(SqliteKvBlockSource(sqlite))
                 try:
                     from .rpc.client import get_rpc as _get_rpc
                     sources.append(RpcLiteBlockSource(_get_rpc()))

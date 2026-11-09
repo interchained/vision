@@ -53,6 +53,27 @@ def health():
     except Exception:
         db_ok = False
 
+    # Embedded store active: the indexer writes its status to the
+    # embedded KV now, NOT to SQLite — the SQLite copies froze at the
+    # moment of the switch. Read the live values from the engine.
+    try:
+        from ..embedded_store import get_embedded_store
+        _emb = get_embedded_store()
+        if _emb is not None:
+            _lh = _emb.peek_kv("vision:indexer:last_height")
+            if _lh:
+                indexer_height = int(_lh)
+            _st = _emb.peek_kv("vision:indexer:status")
+            if _st:
+                _status = json.loads(_st)
+                _tip = _status.get("tip")
+                if _tip:
+                    rpc_height = _tip
+                    if _tip > 0:
+                        rpc_ok = True
+    except Exception:
+        pass
+
     # ElectrumX — check if the persistent TCP connection is alive
     try:
         from ..electrumx.client import get_electrumx

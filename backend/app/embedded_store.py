@@ -131,6 +131,25 @@ class EmbeddedNedbStore:
 
     # ── key / value ──────────────────────────────────────────────────
 
+    def peek(self, key: str) -> Optional[str]:
+        """Synchronous read straight off the engine (no executor hop).
+
+        For sync contexts that cannot await — notably /api/health,
+        which is deliberately a sync endpoint. Engine reads are
+        in-memory MVCC lookups; a single dict read racing the storage
+        thread's writes is safe for status purposes.
+        """
+        if self._db is None:
+            return None
+        row = self._db.get("kv", key)
+        if not row:
+            return None
+        expires_at = row.get("expires_at")
+        if expires_at is not None and expires_at < time.time():
+            return None
+        v = row.get("value")
+        return None if v is None else str(v)
+
     async def get(self, key: str) -> Optional[str]:
         db = self._engine()
         row = await self._run(db.get, "kv", key)
@@ -358,6 +377,9 @@ class EmbeddedStore:
 
     def stats(self) -> dict:
         return {"active": True, "store": "embedded"}
+
+    def peek_kv(self, key: str) -> Optional[str]:
+        return self._nd.peek(key)
 
     async def sync_state(self) -> dict:
         return await self._nd.get_sync_state()

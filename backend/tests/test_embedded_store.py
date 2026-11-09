@@ -250,6 +250,19 @@ def test_bulk_puts(store):
     run(again())
 
 
+def test_peek_sync_read(store):
+    """peek(): the synchronous engine read /api/health relies on."""
+    async def main():
+        assert store.peek("nope") is None
+        await store.set("vision:indexer:last_height", "914655")
+        assert store.peek("vision:indexer:last_height") == "914655"
+        await store.set("temp", "x", ex=1)
+        assert store.peek("temp") == "x"
+        await store.expire("temp", -5)
+        assert store.peek("temp") is None
+    run(main())
+
+
 def test_serialize_lite_shape():
     raw = {"confirmations": 3, "time": 99, "nTx": 2, "size": 250,
            "weight": 900, "difficulty": 1.5, "version": 0x20004000,
