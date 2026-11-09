@@ -12,6 +12,7 @@ class BlockSummary(BaseModel):
     tx_count: int
     size: int
     weight: Optional[int] = None
+    algo: Optional[str] = None
     miner: Optional[dict] = None
     fee_reward_sats: Optional[int] = None
     subsidy_sats: Optional[int] = None

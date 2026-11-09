@@ -12,6 +12,7 @@ from ..rpc.client import get_rpc, RPCError
 from ..rpc.methods import BlockchainRPC
 from ..services.price import get_cached_price
 from ..utils.emission import total_supply_at
+from ..utils.pow import ALGOS, algo_for_block
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -28,6 +29,107 @@ def _deterministic_supply_at(height: int) -> int:
     return total_supply_at(height)
 
 
+# ---------------------------------------------------------------------------
+# Tri-PoW per-lane scan
+#
+# /stats/network augments the daemon's per-lane difficulty/hashrate (from
+# getmininginfo) with each lane's most recent block and its share of the
+# last 24h of blocks. Those two facts only exist per-block, so we scan
+# down from the tip over the same cached block JSON list_blocks reads
+# (Keys.BLOCK_BY_HEIGHT -> Keys.BLOCK_BY_HASH). Cache-only on purpose:
+# no RPC fallback, so a cold/partial cache degrades to nulls instead of
+# an RPC storm. At ITC's combined block rate 1500 blocks spans well over
+# 24h, and every lane's last block sits within a few dozen blocks of the
+# tip — the bound is a safety net, not an expected limit. Results are
+# cached in-process for a few seconds (keyed on the tip) because the
+# homepage polls this endpoint.
+# ---------------------------------------------------------------------------
+ALGO_SCAN_MAX_BLOCKS = 1500
+ALGO_SCAN_CHUNK = 250
+ALGO_SCAN_CACHE_TTL = 30  # seconds
+
+_algo_scan_cache: dict = {"tip": None, "at": 0.0, "result": None}
+
+
+async def _no_value():
+    return None
+
+
+def _empty_lanes() -> dict:
+    return {a: {"last_block": None, "blocks_24h": 0} for a in ALGOS}
+
+
+async def _scan_algo_lanes(redis, tip_height: int):
+    """Return ({lane: {last_block, blocks_24h}}, total_blocks_24h).
+
+    Never raises — on any failure the lanes come back empty/partial and
+    the caller still serves difficulty/hashrate from getmininginfo.
+    """
+    now = time.time()
+    if (
+        _algo_scan_cache["result"] is not None
+        and _algo_scan_cache["tip"] == tip_height
+        and now - _algo_scan_cache["at"] < ALGO_SCAN_CACHE_TTL
+    ):
+        return _algo_scan_cache["result"]
+
+    lanes = _empty_lanes()
+    total_24h = 0
+    if tip_height and tip_height > 0:
+        cutoff = int(now) - 86_400
+        height = int(tip_height)
+        scanned = 0
+        past_cutoff = False
+        try:
+            while height >= 0 and scanned < ALGO_SCAN_MAX_BLOCKS:
+                if past_cutoff and all(
+                    lane["last_block"] is not None for lane in lanes.values()
+                ):
+                    break
+                chunk = list(range(height, max(-1, height - ALGO_SCAN_CHUNK), -1))
+                hashes = await asyncio.gather(
+                    *[redis.get(Keys.BLOCK_BY_HEIGHT.format(height=h)) for h in chunk],
+                    return_exceptions=True,
+                )
+                raws = await asyncio.gather(
+                    *[
+                        redis.get(Keys.BLOCK_BY_HASH.format(hash=hsh))
+                        if hsh and not isinstance(hsh, Exception)
+                        else _no_value()
+                        for hsh in hashes
+                    ],
+                    return_exceptions=True,
+                )
+                for h, raw in zip(chunk, raws):
+                    scanned += 1
+                    if not raw or isinstance(raw, Exception):
+                        continue
+                    try:
+                        b = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    btime = b.get("time") or 0
+                    lane = lanes[algo_for_block(b.get("version", 0), h)]
+                    if lane["last_block"] is None:
+                        lane["last_block"] = {
+                            "height": h,
+                            "hash": b.get("hash"),
+                            "time": btime,
+                        }
+                    if btime >= cutoff:
+                        lane["blocks_24h"] += 1
+                        total_24h += 1
+                    elif btime:
+                        past_cutoff = True
+                height -= ALGO_SCAN_CHUNK
+        except Exception as e:  # garnish must never break the endpoint
+            logger.warning("algo lane scan failed (%s); serving partial lanes", e)
+
+    result = (lanes, total_24h)
+    _algo_scan_cache.update(tip=tip_height, at=now, result=result)
+    return result
+
+
 @router.get("/stats/network")
 async def network_stats():
     rpc = BlockchainRPC(get_rpc())
@@ -37,6 +139,22 @@ async def network_stats():
     redis = get_redis()
     mempool_raw = await redis.get(Keys.MEMPOOL_SUMMARY)
     mempool_summary = json.loads(mempool_raw) if mempool_raw else None
+
+    # Tri-PoW per-lane detail: difficulty + hashrate come straight from
+    # getmininginfo's per-lane fields; last block + 24h share come from
+    # the bounded tip scan (degrades to nulls/zeros, never an error).
+    scan_lanes, total_24h = await _scan_algo_lanes(redis, info.get("blocks") or 0)
+    algos = {}
+    for lane_name in ALGOS:
+        lane = scan_lanes.get(lane_name) or {"last_block": None, "blocks_24h": 0}
+        count = lane["blocks_24h"]
+        algos[lane_name] = {
+            "difficulty": mining.get(f"difficulty_{lane_name}"),
+            "networkhashps": mining.get(f"networkhashps_{lane_name}"),
+            "last_block": lane["last_block"],
+            "blocks_24h": count,
+            "share_pct_24h": round(100.0 * count / total_24h, 2) if total_24h else 0.0,
+        }
 
     return {
         "chain": info.get("chain"),
@@ -55,6 +173,7 @@ async def network_stats():
         "protocol_version": network.get("protocolversion"),
         "connections": network.get("connections"),
         "mempool": mempool_summary,
+        "algos": algos,
     }
 
 
