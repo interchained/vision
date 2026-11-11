@@ -189,6 +189,23 @@ python scripts/migrate_domain_sqlite_to_nedb.py \
 bash start.sh
 ```
 
+**One-time bounded-open conversion (existing data dirs):** the
+engine's stock open replays + re-verifies the entire op history on
+every start — at production scale that is minutes of CPU and
+multiple GB of RAM. Convert each existing embedded dir ONCE,
+backend stopped, before starting:
+
+```bash
+python scripts/checkpoint_embedded.py --dir ../data/vision-embedded
+```
+
+It performs the slow audited open (full chain verify included),
+records a checkpoint + `vision-open.json` sidecar, and proves the
+bounded reopen. After that, opens are O(live state + new ops):
+the backend checkpoints again on every clean shutdown, so the
+fast path maintains itself. Re-running the script with
+`--verify-only` is the full integrity audit.
+
 **Verify:**
 
 ```bash

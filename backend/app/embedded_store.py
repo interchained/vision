@@ -35,7 +35,9 @@ scripts/migrate_domain_sqlite_to_nedb.py).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional, Sequence, Tuple
@@ -54,6 +56,244 @@ SYNC_COMPLETE_KEY = "vision:sync:complete"
 def _nql_escape(s: str) -> str:
     """Escape a string for embedding in an NQL double-quoted literal."""
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+# ── bounded open ─────────────────────────────────────────────────────
+#
+# Why this exists: the engine's stock NEDB(path) open is O(history).
+# _load() parses EVERY AOF line into an in-memory Op (payload dict
+# included, kept forever in log.ops) and folds every op into the
+# in-memory MVCC store; then _open() unconditionally runs
+# _self_heal_if_needed(), whose log.verify() re-canonicalizes and
+# re-hashes EVERY op. None of that is skipped when a snapshot
+# exists — the stock snapshot branch still parses the whole AOF and
+# still verifies the whole chain. Measured on a 200k-doc repro dir
+# (183 MB AOF): stock open 13.9 s / 566 MB, and WITH a checkpoint
+# snapshot present 13.3 s / 720 MB. Production holds ~9x that
+# (~1.8M docs), which is how the backend OOM-killed at ~5 GB RSS on
+# the 16 GB production box while "just opening" its data dir.
+#
+# The fix: checkpoint_embedded_db() takes an engine checkpoint and
+# records a sidecar (vision-open.json) beside snapshot.json with
+# the checkpoint seq, the head hash, the AOF byte offset just past
+# the checkpoint op, and the snapshot size. _BoundedNEDB._load(),
+# when the sidecar is provably consistent (snapshot size matches,
+# AOF only grew, and the first delta op chains from the recorded
+# head — a hash check, not a guess), restores state via the
+# engine's own load_snapshot(), seeks the AOF to the recorded
+# offset, and parses ONLY the delta ops. The in-memory log is
+# padded with one shared inert placeholder per pre-checkpoint op
+# so len(log) — hence the seq of every future append, and db.seq —
+# stays globally correct; nonce/idem tables are merged back from
+# the snapshot so replay protection survives intact.
+#
+# Bounded open cost tracks LIVE STATE (the snapshot) + ops since
+# the checkpoint, not total history: stock open grows with HISTORY
+# (every op ever written, incl. rewrites of the same keys), the
+# bounded open only with the state that history produced. Same
+# repro dir after conversion: 3.4 s / 573 MB (vs 13.9 s / 566 MB
+# stock at this scale — RSS is state-dominated here; at
+# production's ~9x the stock open reaches the observed ~5 GB
+# while the bounded open stays state-sized).
+#
+# Semantics kept: every read/write Vision issues, MVCC head state,
+# seq allocation, idempotency, replay protection. Semantics
+# narrowed — the same narrowing the engine's own snapshot format
+# already documents ("pre-checkpoint time-travel is not supported
+# without the full AOF"): in this runtime instance the
+# pre-checkpoint op payloads are not resident, so AS OF /
+# changefeed reads over pre-checkpoint history need an offline
+# stock open. Vision never issues those against the embedded
+# store (its AS OF routes proxy to a separate nedbd over HTTP).
+#
+# _self_heal_if_needed() is disabled in the subclass: it exists to
+# repair a historical ENCRYPT-backfill chain break, Vision's dirs
+# are unencrypted, and its unconditional full-chain verify() is
+# the most expensive single phase of stock open. Full integrity
+# verification remains one command away — scripts/
+# checkpoint_embedded.py opens with the STOCK engine (heal +
+# verify included) and is the audited conversion path.
+
+_OPEN_SIDECAR = "vision-open.json"
+
+_bounded_cls = None
+
+
+def checkpoint_embedded_db(db, path: str) -> dict:
+    """Take an engine checkpoint on ``db`` and record the
+    bounded-open sidecar next to it. Returns the sidecar dict.
+
+    The AOF offset is captured after db.checkpoint() returns (the
+    engine flushes the checkpoint op to disk first), so it points
+    exactly at the first post-checkpoint op line.
+    """
+    head = db.checkpoint()
+    sidecar = {
+        "version": 1,
+        "checkpoint_seq": len(db.log.ops) - 1,
+        "head": head,
+        "aof_offset": os.path.getsize(os.path.join(path, "log.aof")),
+        "snapshot_bytes": os.path.getsize(
+            os.path.join(path, "snapshot.json")),
+    }
+    tmp = os.path.join(path, _OPEN_SIDECAR + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(sidecar, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, os.path.join(path, _OPEN_SIDECAR))
+    return sidecar
+
+
+def _bounded_nedb_class():
+    """The NEDB subclass with the bounded _load, built lazily so
+    importing this module stays free of the engine import."""
+    global _bounded_cls
+    if _bounded_cls is not None:
+        return _bounded_cls
+
+    import re
+
+    from nedb import NEDB
+    from nedb import crypto as _crypto
+    from nedb import snapshot as _snap
+    from nedb.engine import apply_op
+    from nedb.log import Op
+
+    # One shared inert Op stands in for every pre-checkpoint op:
+    # OpLog.load() only reads .nonce/.client/.idem off each entry
+    # (all inert here) and .hash off the LAST entry (overridden
+    # explicitly when the delta is empty), while len() keeps seq
+    # allocation globally correct. 8 bytes of pointer per op
+    # instead of a full payload dict.
+    _PAD = Op(0, "", 0, "checkpoint", {}, 0.0, None, "", "")
+
+    class _BoundedNEDB(NEDB):
+        _open_info: dict = {"mode": "fresh"}
+
+        def _self_heal_if_needed(self) -> None:
+            # Disabled — see the bounded-open notes above. The
+            # stock version runs a full-chain verify() here on
+            # every open; integrity audits run offline via
+            # scripts/checkpoint_embedded.py (stock open).
+            return
+
+        def _load(self) -> None:
+            info = self._bounded_load()
+            if info is None:
+                super()._load()
+                self._open_info = {"mode": "full-replay"}
+            else:
+                self._open_info = info
+
+        def _bounded_load(self):
+            """Snapshot + delta-only load. Returns the open-info
+            dict, or None when the bounded path is not provably
+            safe and the caller must use the stock loader. Once
+            load_snapshot() has run this never returns None — it
+            degrades to the stock snapshot branch instead."""
+            aof_path = self._aof_path
+            snap_path = _snap._snap_path(self.path)
+            sidecar_path = os.path.join(self.path, _OPEN_SIDECAR)
+            try:
+                if not (os.path.exists(sidecar_path)
+                        and os.path.exists(snap_path)
+                        and os.path.exists(aof_path)):
+                    return None
+                with open(sidecar_path, encoding="utf-8") as fh:
+                    sidecar = json.load(fh)
+                if sidecar.get("version") != 1:
+                    return None
+                if os.path.getsize(snap_path) != sidecar["snapshot_bytes"]:
+                    return None
+                if os.path.getsize(aof_path) < sidecar["aof_offset"]:
+                    return None
+                # The sidecar head must be the head the snapshot
+                # itself anchored (snapshot.json v1 writes it in
+                # the first bytes). This is what makes the
+                # empty-delta case sound: with no delta ops to
+                # chain-check, the recorded head is trusted only
+                # because the snapshot agrees with it.
+                with open(snap_path, "rb") as fh:
+                    prefix = fh.read(1024).decode("utf-8", "ignore")
+                m = re.search(r'"head"\s*:\s*"([0-9a-f]+)"', prefix)
+                if not m or m.group(1) != sidecar["head"]:
+                    return None
+            except Exception:
+                return None
+
+            snap_seq = _snap.load_snapshot(self)
+            if snap_seq < 0:
+                # load_snapshot bails before mutating state on an
+                # unreadable/foreign snapshot, so the stock loader
+                # is still safe here.
+                return None
+            if snap_seq != sidecar["checkpoint_seq"]:
+                return self._snapshot_full_parse(snap_seq)
+
+            snap_nonces = dict(self.log._last_nonce)
+            snap_idem = dict(self.log._idem)
+            delta: list = []
+            try:
+                with open(aof_path, encoding="utf-8") as fh:
+                    fh.seek(sidecar["aof_offset"])
+                    for raw in fh:
+                        line = _crypto.aof_decode(raw, self._dek)
+                        if line:
+                            delta.append(Op.from_dict(json.loads(line)))
+            except Exception:
+                return self._snapshot_full_parse(snap_seq)
+
+            # The delta must chain, link by link, from the head the
+            # checkpoint anchored. Field comparison only — no
+            # re-hashing — but a foreign/replaced snapshot or a
+            # truncated AOF cannot pass it.
+            prev = sidecar["head"]
+            for op in delta:
+                if op.seq <= snap_seq or op.prev_hash != prev:
+                    return self._snapshot_full_parse(snap_seq)
+                prev = op.hash
+
+            self.log.load([_PAD] * (snap_seq + 1) + delta)
+            if not delta:
+                self.log._head = sidecar["head"]
+            for client, nonce in snap_nonces.items():
+                if nonce > self.log._last_nonce.get(client, 0):
+                    self.log._last_nonce[client] = nonce
+            for key, seq in snap_idem.items():
+                self.log._idem.setdefault(key, seq)
+            for op in delta:
+                apply_op(self.store, self.relations, self.indexes,
+                         op, self.cause_map)
+            self._nonce = dict(self.log._last_nonce)
+            return {"mode": "snapshot-bounded",
+                    "checkpoint_seq": snap_seq,
+                    "delta_ops": len(delta)}
+
+        def _snapshot_full_parse(self, snap_seq: int) -> dict:
+            """The engine's stock snapshot branch: state already
+            restored from the snapshot, the full AOF is parsed to
+            rebuild the log, only post-checkpoint ops are folded.
+            Correct but O(history) — the degraded fallback when the
+            sidecar cannot be trusted."""
+            ops: list = []
+            if os.path.exists(self._aof_path):
+                with open(self._aof_path, encoding="utf-8") as fh:
+                    for raw in fh:
+                        line = _crypto.aof_decode(raw, self._dek)
+                        if line:
+                            ops.append(Op.from_dict(json.loads(line)))
+            self.log.load(ops)
+            for op in self.log.ops:
+                if op.seq > snap_seq:
+                    apply_op(self.store, self.relations, self.indexes,
+                             op, self.cause_map)
+            self._nonce = dict(self.log._last_nonce)
+            return {"mode": "snapshot-full-parse",
+                    "checkpoint_seq": snap_seq}
+
+    _bounded_cls = _BoundedNEDB
+    return _bounded_cls
 
 
 class EmbeddedNedbStore(EmbeddedDomainMixin):
@@ -120,8 +360,7 @@ class EmbeddedNedbStore(EmbeddedDomainMixin):
             return
 
         def _open():
-            from nedb import NEDB
-            db = NEDB(self._path)
+            db = _bounded_nedb_class()(self._path)
             # Domain-layer indexes: equality lookups on these fields
             # are the hot paths (address pages, snapshot scans).
             # create_index is idempotent and cheap on an indexed
@@ -144,11 +383,27 @@ class EmbeddedNedbStore(EmbeddedDomainMixin):
             return db
 
         self._db = await self._run(_open)
-        logger.info("EmbeddedNedbStore open at %s", self._path)
+        logger.info(
+            "EmbeddedNedbStore open at %s (%s)",
+            self._path, getattr(self._db, "_open_info", {"mode": "?"}),
+        )
 
     async def aclose(self) -> None:
         if self._db is not None:
             db, self._db = self._db, None
+            # Checkpoint on clean close so the NEXT open takes the
+            # bounded path (snapshot + small delta). Best-effort: a
+            # failed checkpoint never loses data (the AOF is the
+            # source of truth) — it only means the next open
+            # replays more. Disable with
+            # VISION_EMBEDDED_CHECKPOINT_ON_CLOSE=0.
+            if os.environ.get(
+                    "VISION_EMBEDDED_CHECKPOINT_ON_CLOSE", "1") != "0":
+                try:
+                    await self._run(checkpoint_embedded_db, db, self._path)
+                except Exception as e:
+                    logger.warning(
+                        "embedded checkpoint on close failed: %s", e)
             try:
                 await self._run(db.close)
             except Exception:
