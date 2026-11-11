@@ -5,12 +5,13 @@ Walks blocks (verbosity=2 from the node), extracts addresses from output
 spent UTXO in our local table. The output is a self-sufficient address
 database that the explorer queries directly — no ElectrumX required.
 
-Per-block writes go through ``AddressIndexWriter`` on a dedicated SQLite
-connection so each block's UTXO mutations, address-tx rows, indexed
-block-hash record, and ``last_height`` pointer commit (or roll back)
-together as a single transaction. A crash mid-block leaves the database
-exactly as it was before that block was attempted; restart-resume is
-therefore safe and never requires a rebuild.
+Per-block writes go through ``EmbeddedAddressIndexWriter`` on the
+embedded NEDB engine so each block's UTXO mutations, address-tx
+rows, indexed block-hash record, and ``last_height`` pointer land
+together in a single storage job (or not at all). A crash mid-block
+leaves the database exactly as it was before that block was
+attempted; restart-resume is therefore safe and never requires a
+rebuild.
 
 Reorg handling: the loop self-detects drift on every iteration by
 comparing its recorded per-height hashes (in ``address_index_blocks``)
@@ -26,9 +27,10 @@ import logging
 from typing import Iterable, Optional
 
 from ..config import settings
+from ..embedded_domain import get_address_index_writer
 from ..rpc.client import RPCConnectionError, RPCError, get_rpc
 from ..rpc.methods import BlockchainRPC
-from ..sqlite_store import Keys, get_address_index_writer, get_db
+from ..sqlite_store import Keys, get_db
 
 logger = logging.getLogger(__name__)
 

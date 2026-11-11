@@ -67,8 +67,8 @@ npm start
 
 ## 3. First run — what to expect
 
-On first start the backend opens a fresh SQLite database and begins
-**two indexers in parallel**:
+On first start the backend opens the embedded NEDB store
+(`data/vision-embedded/`) and begins **two indexers in parallel**:
 
 1. **Block indexer** — caches block headers and recent tx records. Fast.
 2. **Address indexer** — walks every block at verbosity=2 and builds a
@@ -84,7 +84,7 @@ curl http://localhost:8080/api/address-index/status
 
 Once `phase` reads `"live"` you're caught up. **Restarts always resume
 from the last persisted height** — the address index is never rebuilt
-unless you explicitly delete `data/vision.db`.
+unless you explicitly delete `data/vision-embedded/`.
 
 ---
 
@@ -122,8 +122,9 @@ If you put the API on a different origin from the web, set the three
 
 ## 5. Operational notes
 
-- **Backups**: snapshot `data/vision.db` (and the WAL/SHM siblings) for
-  a point-in-time recovery. SQLite WAL mode allows hot copies.
+- **Backups**: snapshot the `data/vision-embedded/` directory (the
+  live store). `data/vision.db` is a **cold backup only** — the
+  migrated-from SQLite file; the backend never opens it (see §7).
 - **Restarts are cheap.** The address indexer resumes from the last
   persisted height; no re-walking, no reindex.
 - **Reorgs are automatic** within `REORG_DEPTH` (default 6 blocks). The
@@ -146,3 +147,63 @@ docker compose up -d --build   # or repeat the bare-metal step 2
 ```
 
 Database is preserved. The address index resumes where it left off.
+
+---
+
+## 7. Production: embedded NEDB only (cutover runbook)
+
+The live store is the **embedded NEDB engine** — KV, UTXO ledger,
+address history, pools and snapshots all live in
+`data/vision-embedded/`, in-process. There is **no SQLite fallback**:
+if the embedded store cannot open, the backend refuses to start
+rather than silently serving a stale file. SQLite (`vision.db`)
+remains on disk as a **cold backup / migration source only**.
+
+**Required `.env` (production):**
+
+```bash
+STORE_MODE=embedded      # the only accepted value; anything else fails startup
+DISABLE_SQLITE=1         # kill switch: constructing SQLiteStore raises RuntimeError
+NEDB_EMBEDDED_DIR=../data/vision-embedded
+# NEDB_URL=http://127.0.0.1:7070   # optional: legacy nedbd as a secondary
+#                                  # history-sync source (never for serving)
+```
+
+**One-time cutover from an existing SQLite-backed deployment**
+(run from `backend/`, backend stopped):
+
+```bash
+# 1. (Optional, speeds the first history sync) copy the KV layer to
+#    the legacy nedbd store; the backfill can then read block docs
+#    from it as a secondary source. Skippable — RPC works alone.
+python scripts/migrate_sqlite_to_nedb.py --sqlite ../data/vision.db
+
+# 2. Copy the DOMAIN tables into the embedded engine dir (UTXOs,
+#    address tx index + its control keys, undo log, pools,
+#    snapshots, entries, reward blocks; id counters seeded).
+#    Streaming + resumable; safe to re-run.
+python scripts/migrate_domain_sqlite_to_nedb.py \
+    --sqlite ../data/vision.db --embedded-dir ../data/vision-embedded
+
+# 3. Set the .env values above, then start the backend.
+bash start.sh
+```
+
+**Verify:**
+
+```bash
+curl http://localhost:8080/api/health
+# → "db": true, "sync": {"active": true, "store": "embedded", ...}
+#   and "indexer_height" advancing. /api/stats/indexer should leave
+#   the "starting" phase as the address indexer resumes from the
+#   migrated height (not from genesis).
+```
+
+**After cutover:** leave `data/vision.db` (and its `-wal`/`-shm`)
+exactly where it is — untouched cold backup. Do not delete it in
+the same change that ships this cutover; it is the rollback path
+(revert the deploy + remove `DISABLE_SQLITE` to return to the
+pre-cutover code). The backwards history sync fills any block-KV
+gaps from RPC (plus nedbd if `NEDB_URL` is set); when
+`"sync": {"complete": true}` appears in `/api/health`, the embedded
+store holds the full history on its own.

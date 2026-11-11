@@ -4,19 +4,20 @@ The serving model (replaces the DualStore + NedbBackfillTask design):
 
 1. **Checkpoint at tip, serve immediately.** At startup the embedded
    store is seeded with the tip window (tip keys + the most recent
-   ~100 blocks) copied from SQLite's KV cache, and the current tip
-   height is recorded as the sync checkpoint. The explorer serves
-   live data from the first second.
+   ~100 blocks) and the current tip height is recorded as the sync
+   checkpoint. On the live path the seed comes from the daemon via
+   RPC (``seed_tip_window_from_rpc``); the SQLite-sourced variant
+   (``seed_tip_window``) remains for offline tooling/tests. The
+   explorer serves live data from the first second.
 2. **Sync backwards in the background.** This task walks from the
    checkpoint down to genesis, copying each block's KV docs
    (``BLOCK_BY_HEIGHT`` / ``BLOCK_BY_HASH`` / ``RECENT_BLOCKS`` —
    exactly the writes the block indexer makes per block) into the
-   embedded store. Sources, in order: SQLite's KV cache (always
-   complete, local, byte-identical docs), the legacy nedbd HTTP
-   store (the data also lives there from the DualStore era, but it
-   is a remote round-trip per block — as primary source it throttled
-   the production descent to ~100 blocks/min), and finally live RPC
-   in the indexer's own "lite" serialization.
+   embedded store. Live source order: live RPC in the indexer's own
+   "lite" serialization first, then the legacy nedbd HTTP store
+   (when ``NEDB_URL`` is set). ``SqliteKvBlockSource`` is retained
+   for offline use only — SQLite is a backup / migration source,
+   never a live one.
 3. **Progress is public.** The contiguous synced floor
    (``vision:sync:lowest_synced``) lives in the embedded store and is
    surfaced via /api/health, so the UI can show sync progress and
@@ -200,6 +201,97 @@ async def seed_tip_window(sqlite, embedded: EmbeddedNedbStore,
 
     logger.info(
         "Embedded tip window seeded: tip=%d seeded=%d lowest=%d",
+        tip, seeded, lowest,
+    )
+    _publish_status(
+        checkpoint_height=tip,
+        lowest_synced=lowest if seeded else tip,
+    )
+    return {"tip": tip, "seeded": seeded, "lowest": lowest}
+
+
+async def seed_tip_window_from_rpc(embedded: EmbeddedNedbStore,
+                                   rpc_client,
+                                   window: int = 100,
+                                   attempts: int = 3) -> dict:
+    """RPC-only variant of :func:`seed_tip_window` for the NEDB-only
+    live path: fetch the tip + the most recent ``window`` blocks from
+    the daemon (lite serialization, byte-identical to the indexer's)
+    and record the sync checkpoint. No SQLite involved.
+
+    On an already-populated store this is a cheap no-op refresh of
+    the tip keys; the checkpoint/floor are only ever moved forwards /
+    downwards respectively, exactly as in the SQLite-sourced seed.
+
+    Returns {"tip": int, "seeded": int, "lowest": int}. Raises after
+    ``attempts`` tries if the daemon can't give us a tip — without a
+    checkpoint the backfill cannot run, so failing loudly is right.
+    """
+    from ..rpc.methods import BlockchainRPC
+    rpc = BlockchainRPC(rpc_client)
+
+    tip: Optional[int] = None
+    last_err: Optional[Exception] = None
+    for _ in range(max(1, attempts)):
+        try:
+            tip = int(await rpc.get_block_count())
+            break
+        except Exception as e:  # noqa: BLE001 — retried, then raised
+            last_err = e
+            await asyncio.sleep(2)
+    if tip is None:
+        raise RuntimeError(
+            f"seed_tip_window_from_rpc: daemon tip unreachable: {last_err}"
+        )
+
+    def _kv(key, value):
+        return ("kv", key, {"_id": key, "value": str(value),
+                            "expires_at": None})
+
+    ops: list = [_kv(Keys.TIP_HEIGHT, tip)]
+    seeded = 0
+    lowest = tip
+    # Descend from the tip so the seeded window is contiguous below
+    # it (the backfill contract); the first hole stops the seed.
+    for h in range(tip, max(-1, tip - window), -1):
+        try:
+            bhash = await rpc.get_block_hash(h)
+            block_raw = await rpc.get_block(bhash, verbosity=1)
+        except Exception as e:  # noqa: BLE001 — a hole stops the seed
+            logger.warning(
+                "seed_tip_window_from_rpc: block %d unavailable (%s) "
+                "— seeded window starts above it", h, e,
+            )
+            break
+        raw = serialize_lite(h, bhash, block_raw)
+        by_height = Keys.BLOCK_BY_HEIGHT.format(height=h)
+        by_hash = Keys.BLOCK_BY_HASH.format(hash=bhash)
+        zid = f"{Keys.RECENT_BLOCKS}::{bhash}"
+        ops.append(_kv(by_height, bhash))
+        ops.append(_kv(by_hash, raw))
+        ops.append(("zset", zid, {
+            "_id": zid, "_name": Keys.RECENT_BLOCKS,
+            "_member": bhash, "score": float(h),
+        }))
+        if h == tip:
+            ops.append(_kv(Keys.TIP_HASH, bhash))
+        seeded += 1
+        lowest = min(lowest, h)
+
+    existing_cp = await embedded.get(SYNC_CHECKPOINT_KEY)
+    if existing_cp is None and tip > 0:
+        ops.append(_kv(SYNC_CHECKPOINT_KEY, tip))
+    existing_lowest = await embedded.get(SYNC_LOWEST_KEY)
+    if existing_lowest is None:
+        ops.append(_kv(SYNC_LOWEST_KEY, lowest if seeded else tip))
+    elif seeded and lowest < int(existing_lowest):
+        ops.append(_kv(SYNC_LOWEST_KEY, lowest))
+
+    if ops:
+        await embedded.bulk_puts(ops)
+
+    logger.info(
+        "Embedded tip window seeded from RPC: tip=%d seeded=%d lowest=%d",
         tip, seeded, lowest,
     )
     _publish_status(

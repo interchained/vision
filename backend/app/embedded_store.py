@@ -23,9 +23,13 @@ the engine never sees concurrent calls, the event loop never blocks
 on storage I/O, and read-modify-write operations (incr) are atomic
 in practice.
 
-The domain surface (utxo_*, address_*, pool_*, snapshot_*) stays on
-SQLite — see ``EmbeddedStore``, the drop-in ``get_db()`` override
-that routes KV methods here and domain methods to SQLiteStore.
+The domain surface (utxo_*, address_*, pool_*, snapshot_*,
+entries_*, reward_blocks_*) also lives on the embedded engine —
+see ``embedded_domain.EmbeddedDomainMixin``, which
+``EmbeddedNedbStore`` inherits. SQLite is no longer in the live
+path at all: it remains only as the offline backup / migration
+source (scripts/migrate_sqlite_to_nedb.py,
+scripts/migrate_domain_sqlite_to_nedb.py).
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, List, Optional, Sequence, Tuple
+
+from .embedded_domain import EmbeddedDomainMixin
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +56,13 @@ def _nql_escape(s: str) -> str:
     return str(s).replace("\\", "\\\\").replace('"', '\\"')
 
 
-class EmbeddedNedbStore:
-    """Async facade over the embedded NEDB engine (KV/zset/set subset)."""
+class EmbeddedNedbStore(EmbeddedDomainMixin):
+    """Async facade over the embedded NEDB engine.
+
+    KV/zset/set primitives are defined here; the domain surface
+    (utxo/address/pool/snapshot/entries/reward-blocks) comes from
+    EmbeddedDomainMixin, implemented on the same primitives.
+    """
 
     def __init__(self, path: str) -> None:
         self._path = path
@@ -110,7 +121,27 @@ class EmbeddedNedbStore:
 
         def _open():
             from nedb import NEDB
-            return NEDB(self._path)
+            db = NEDB(self._path)
+            # Domain-layer indexes: equality lookups on these fields
+            # are the hot paths (address pages, snapshot scans).
+            # create_index is idempotent and cheap on an indexed
+            # collection; failures are non-fatal (queries fall back
+            # to scans, still correct).
+            for coll, field in (
+                ("utxo", "address"), ("utxo", "height"),
+                ("addr_tx", "address"), ("addr_tx", "txid"),
+                ("addr_tx", "height"),
+                ("utxo_undo", "height"),
+                ("pool", "payout_address"),
+                ("snapshot", "start_height"),
+                ("entry", "snapshot_id"),
+                ("reward_block", "snapshot_id"),
+            ):
+                try:
+                    db.create_index(coll, field)
+                except Exception:
+                    pass
+            return db
 
         self._db = await self._run(_open)
         logger.info("EmbeddedNedbStore open at %s", self._path)
@@ -342,6 +373,17 @@ class EmbeddedNedbStore:
         await self._run(db.collections)
         return True
 
+    def peek_ping(self) -> bool:
+        """Synchronous liveness check for /api/health: True when the
+        engine is open and answering. Never raises."""
+        if self._db is None:
+            return False
+        try:
+            self._db.collections()
+            return True
+        except Exception:
+            return False
+
     async def publish(self, channel: str, message: str) -> int:
         return 0
 
@@ -366,13 +408,15 @@ class EmbeddedNedbStore:
 
 
 class EmbeddedStore:
-    """Drop-in ``get_db()`` override: KV layer → embedded NEDB,
-    domain layer → SQLite. The DualStore's replacement — one store
-    per concern, no mirroring, no circuit breaker, no HTTP.
+    """Drop-in ``get_db()`` override backed entirely by the embedded
+    NEDB engine: KV/zset/set AND the domain layer (UTXO ledger,
+    address history, pools, snapshots) all route to
+    EmbeddedNedbStore. SQLite is not constructed anywhere in the
+    live path — it survives only as the offline backup / migration
+    source.
     """
 
-    def __init__(self, sqlite, embedded: EmbeddedNedbStore) -> None:
-        self._sq = sqlite
+    def __init__(self, embedded: EmbeddedNedbStore) -> None:
         self._nd = embedded
 
     def stats(self) -> dict:
@@ -380,6 +424,9 @@ class EmbeddedStore:
 
     def peek_kv(self, key: str) -> Optional[str]:
         return self._nd.peek(key)
+
+    def peek_ping(self) -> bool:
+        return self._nd.peek_ping()
 
     async def sync_state(self) -> dict:
         return await self._nd.get_sync_state()
@@ -421,85 +468,124 @@ class EmbeddedStore:
     async def srem(self, name: str, *members: str) -> int:
         return await self._nd.srem(name, *members)
 
-    # ── domain methods → SQLite ──────────────────────────────────────
+    async def ping(self) -> bool:
+        return await self._nd.ping()
+
+    async def publish(self, channel: str, message: str) -> int:
+        return await self._nd.publish(channel, message)
+
+    async def aclose(self) -> None:
+        return await self._nd.aclose()
+
+    # ── domain methods → embedded NEDB ───────────────────────────────
 
     async def utxo_add_batch(self, rows: Sequence[Tuple[str, int, str, int, int]]) -> None:
-        return await self._sq.utxo_add_batch(rows)
+        return await self._nd.utxo_add_batch(rows)
 
     async def utxo_spend_batch(self, outpoints: Sequence[Tuple[str, int]]) -> List[Tuple[str, int, str, int, int]]:
-        return await self._sq.utxo_spend_batch(outpoints)
+        return await self._nd.utxo_spend_batch(outpoints)
 
     async def address_tx_add_batch(self, *args, **kwargs) -> None:
-        return await self._sq.address_tx_add_batch(*args, **kwargs)
+        return await self._nd.address_tx_add_batch(*args, **kwargs)
 
     async def commit(self) -> None:
-        return await self._sq.commit()
+        return await self._nd.commit()
 
     async def address_balance(self, address: str) -> Tuple[int, int]:
-        return await self._sq.address_balance(address)
+        return await self._nd.address_balance(address)
 
     async def address_tx_count(self, address: str) -> int:
-        return await self._sq.address_tx_count(address)
+        return await self._nd.address_tx_count(address)
 
     async def address_first_last_height(self, address: str) -> Tuple[Optional[int], Optional[int]]:
-        return await self._sq.address_first_last_height(address)
+        return await self._nd.address_first_last_height(address)
 
     async def address_txs(self, *args, **kwargs) -> list:
-        return await self._sq.address_txs(*args, **kwargs)
+        return await self._nd.address_txs(*args, **kwargs)
 
     async def address_utxos(self, address: str) -> list:
-        return await self._sq.address_utxos(address)
+        return await self._nd.address_utxos(address)
 
     async def address_index_rollback(self, from_height: int) -> None:
-        return await self._sq.address_index_rollback(from_height)
+        return await self._nd.address_index_rollback(from_height)
 
     async def address_index_last_height(self) -> int:
-        return await self._sq.address_index_last_height()
+        return await self._nd.address_index_last_height()
 
     async def coinbase_reward_scan(self, *args, **kwargs):
-        return await self._sq.coinbase_reward_scan(*args, **kwargs)
+        return await self._nd.coinbase_reward_scan(*args, **kwargs)
 
     async def pool_create(self, data: dict) -> int:
-        return await self._sq.pool_create(data)
+        return await self._nd.pool_create(data)
 
     async def pool_update(self, pool_id: int, data: dict) -> bool:
-        return await self._sq.pool_update(pool_id, data)
+        return await self._nd.pool_update(pool_id, data)
 
     async def pool_get(self, pool_id: int) -> Optional[dict]:
-        return await self._sq.pool_get(pool_id)
+        return await self._nd.pool_get(pool_id)
 
     async def pool_find_by_payout_address(self, *args, **kwargs) -> Optional[dict]:
-        return await self._sq.pool_find_by_payout_address(*args, **kwargs)
+        return await self._nd.pool_find_by_payout_address(*args, **kwargs)
 
     async def pool_list(self, *args, **kwargs) -> list:
-        return await self._sq.pool_list(*args, **kwargs)
+        return await self._nd.pool_list(*args, **kwargs)
 
     async def snapshot_create(self, data: dict) -> int:
-        return await self._sq.snapshot_create(data)
+        return await self._nd.snapshot_create(data)
 
     async def snapshot_create_guarded(self, data: dict) -> Optional[int]:
-        return await self._sq.snapshot_create_guarded(data)
+        return await self._nd.snapshot_create_guarded(data)
 
     async def snapshot_delete(self, snapshot_id: int) -> bool:
-        return await self._sq.snapshot_delete(snapshot_id)
+        return await self._nd.snapshot_delete(snapshot_id)
 
     async def snapshots_delete_by_status(self, statuses: Sequence[str]) -> int:
-        return await self._sq.snapshots_delete_by_status(statuses)
+        return await self._nd.snapshots_delete_by_status(statuses)
 
     async def snapshot_get(self, snapshot_id: int) -> Optional[dict]:
-        return await self._sq.snapshot_get(snapshot_id)
+        return await self._nd.snapshot_get(snapshot_id)
 
     async def snapshot_list(self, *args, **kwargs) -> list:
-        return await self._sq.snapshot_list(*args, **kwargs)
+        return await self._nd.snapshot_list(*args, **kwargs)
 
     async def snapshot_set_totals(self, *args, **kwargs) -> None:
-        return await self._sq.snapshot_set_totals(*args, **kwargs)
+        return await self._nd.snapshot_set_totals(*args, **kwargs)
 
     async def snapshot_set_status(self, *args, **kwargs) -> bool:
-        return await self._sq.snapshot_set_status(*args, **kwargs)
+        return await self._nd.snapshot_set_status(*args, **kwargs)
+
+    async def snapshot_mark_failed(self, *args, **kwargs) -> bool:
+        return await self._nd.snapshot_mark_failed(*args, **kwargs)
+
+    async def snapshot_finalize(self, *args, **kwargs) -> bool:
+        return await self._nd.snapshot_finalize(*args, **kwargs)
+
+    async def snapshot_clear_results(self, snapshot_id: int) -> None:
+        return await self._nd.snapshot_clear_results(snapshot_id)
 
     async def snapshot_range_exists(self, start_height: int, end_height: int) -> bool:
-        return await self._sq.snapshot_range_exists(start_height, end_height)
+        return await self._nd.snapshot_range_exists(start_height, end_height)
+
+    async def entries_insert_batch(self, rows) -> None:
+        return await self._nd.entries_insert_batch(rows)
+
+    async def entries_list(self, snapshot_id: int) -> list:
+        return await self._nd.entries_list(snapshot_id)
+
+    async def entry_get(self, entry_id: int) -> Optional[dict]:
+        return await self._nd.entry_get(entry_id)
+
+    async def entry_update(self, *args, **kwargs) -> bool:
+        return await self._nd.entry_update(*args, **kwargs)
+
+    async def entries_set_status_all(self, snapshot_id: int, status: str) -> int:
+        return await self._nd.entries_set_status_all(snapshot_id, status)
+
+    async def reward_blocks_insert_batch(self, rows) -> None:
+        return await self._nd.reward_blocks_insert_batch(rows)
+
+    async def reward_blocks_list(self, *args, **kwargs) -> list:
+        return await self._nd.reward_blocks_list(*args, **kwargs)
 
 
 # ── module-level singleton ───────────────────────────────────────────

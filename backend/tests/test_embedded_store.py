@@ -276,23 +276,24 @@ def test_serialize_lite_shape():
 
 
 def test_embedded_store_delegation(tmp_path):
-    """EmbeddedStore: KV → embedded NEDB, domain → sqlite side."""
+    """EmbeddedStore: KV AND domain both served by the embedded
+    engine — SQLite is not in the picture at all."""
     async def main():
         emb = EmbeddedNedbStore(str(tmp_path / "embedded"))
         await emb.open()
 
-        class FakeSqlite:
-            async def address_balance(self, address):
-                return (123, 1)
-
-            async def pool_list(self, *a, **k):
-                return [{"id": 1}]
-
-        store = EmbeddedStore(FakeSqlite(), emb)
+        store = EmbeddedStore(emb)
         await store.set("k", "v")
         assert await emb.get("k") == "v"          # KV landed embedded-side
-        assert await store.address_balance("itc1") == (123, 1)
-        assert await store.pool_list() == [{"id": 1}]
+        # Domain served embedded-side too:
+        pid = await store.pool_create({
+            "pool_name": "Pool A", "payout_address": "itc1aaa",
+            "status": "active",
+        })
+        assert (await store.pool_get(pid))["pool_name"] == "Pool A"
+        await store.utxo_add_batch([("tx1", 0, "itc1x", 500, 10)])
+        assert await store.address_balance("itc1x") == (500, 0)
         assert store.stats() == {"active": True, "store": "embedded"}
+        assert store.peek_ping() is True
         await emb.aclose()
     run(main())
