@@ -133,6 +133,9 @@ def main() -> int:
                     help="embedded data dir (default ../data/vision-embedded)")
     ap.add_argument("--verify-only", action="store_true",
                     help="stock open + full chain verify, no checkpoint")
+    ap.add_argument("--skip-verify", action="store_true",
+                    help="skip the explicit full-chain verify pass "
+                         "(the stock open still self-checks as it loads)")
     args = ap.parse_args()
     path = args.dir
 
@@ -147,12 +150,15 @@ def main() -> int:
         db = NEDB(path)  # stock: full replay + self-heal verify inside
         print(f"stock open: {time.time() - t0:.1f}s  ops={len(db.log.ops)}  "
               f"head={db.head[:12]}…")
-        prog.set_phase("phase 2/4: verifying the full hash chain")
-        ok = db.log.verify()
-        print(f"chain verify: {'OK' if ok else 'FAILED'}")
-        if not ok:
-            db.close()
-            return 1
+        if args.skip_verify:
+            print("chain verify: SKIPPED (--skip-verify)")
+        else:
+            prog.set_phase("phase 2/4: verifying the full hash chain")
+            ok = db.log.verify()
+            print(f"chain verify: {'OK' if ok else 'FAILED'}")
+            if not ok:
+                db.close()
+                return 1
         if not args.verify_only:
             prog.set_phase("phase 3/4: writing checkpoint + bounded-open "
                            "sidecar")
