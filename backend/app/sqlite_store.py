@@ -33,6 +33,21 @@ logger = logging.getLogger(__name__)
 _db: Optional[aiosqlite.Connection] = None
 _lock = asyncio.Lock()
 
+
+def _assert_sqlite_enabled() -> None:
+    """Production kill switch (DISABLE_SQLITE=1): the live store is
+    the embedded NEDB engine, and SQLite survives only as the
+    offline backup / migration source. Any app-code path that tries
+    to construct or open the SQLite store then fails loudly instead
+    of silently falling back to the file. (Offline scripts read the
+    file via aiosqlite directly and never trip this guard.)"""
+    if settings.sqlite_disabled:
+        raise RuntimeError(
+            "SQLiteStore is disabled (DISABLE_SQLITE=1): the live "
+            "store is the embedded NEDB engine; SQLite is backup / "
+            "migration-source only."
+        )
+
 # ── Write coordinator ─────────────────────────────────────────────────────────
 # All SQLite mutations — both on the shared KV connection and on the dedicated
 # AddressIndexWriter connection — acquire this lock before touching the file.
@@ -258,6 +273,7 @@ class SQLiteStore:
     """Async facade that mirrors the subset of the Redis API used by Vision."""
 
     def __init__(self, conn: aiosqlite.Connection):
+        _assert_sqlite_enabled()
         self._conn = conn
 
     # ── internal write helper ─────────────────────────────────────────────
@@ -1253,6 +1269,7 @@ async def _migrate_pool_reward_tables(conn: aiosqlite.Connection) -> None:
 
 
 async def _ensure_db() -> aiosqlite.Connection:
+    _assert_sqlite_enabled()
     global _db
     if _db is not None:
         return _db
@@ -1593,6 +1610,7 @@ class AddressIndexWriter:
     _LAST_HEIGHT_KEY = "vision:address_index:last_height"
 
     def __init__(self, conn: aiosqlite.Connection):
+        _assert_sqlite_enabled()
         self._conn = conn
         # Serialize concurrent callers (e.g. backfill batch + tip handler).
         self._lock = asyncio.Lock()

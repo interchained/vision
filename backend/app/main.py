@@ -16,18 +16,16 @@ from .indexer.address_index import get_address_indexer
 from .middleware.errors import register_exception_handlers
 from .middleware.rate_limit import rate_limit_middleware
 from . import nedb_store
+from .embedded_domain import (
+    close_address_index_writer, init_address_index_writer,
+)
 from .embedded_store import (
     EmbeddedNedbStore, EmbeddedStore, set_embedded_store_instance,
 )
-from .sqlite_store import (
-    close_address_index_writer, close_db,
-    init_address_index_writer, init_db,
-    get_db as _get_sqlite_db,
-    set_store_override,
-)
+from .sqlite_store import set_store_override
 from .indexer.embedded_backfill import (
-    EmbeddedBackfillTask, HttpKvBlockSource, SqliteKvBlockSource,
-    RpcLiteBlockSource, seed_tip_window,
+    EmbeddedBackfillTask, HttpKvBlockSource,
+    RpcLiteBlockSource, seed_tip_window_from_rpc,
     get_backfill_task, set_backfill_task,
 )
 from .routes import (
@@ -69,21 +67,26 @@ async def lifespan(app: FastAPI):
                 settings.rpc_base_url, settings.ITC_WALLET_NAME,
                 ex_host, ex_port)
 
-    # IMPORTANT: initialise the SQLite store BEFORE spawning any background
-    # task. If we let _deferred_start race the first /api/health request to
-    # lazy-init the DB (especially while WAL is recovering from a previous
-    # crash/kill), the asyncio write lock can deadlock silently and no
-    # subsequent log line is ever emitted.
-    try:
-        await init_db()
-        logger.info("SQLite store ready")
-    except Exception as e:
-        logger.error("init_db failed at startup: %s", e, exc_info=True)
-        raise
+    # The embedded NEDB engine is the ONLY live store (KV + domain).
+    # Open it and install the get_db() override BEFORE anything else
+    # touches storage, and bind the address-index writer to it.
+    #
+    # Any failure here is FATAL and propagates: the old behaviour —
+    # log "non-fatal" and silently serve from SQLite — is precisely
+    # what this hardening removes. A half-up backend quietly serving
+    # a stale file is worse than a loud crash at boot. SQLite is
+    # never constructed in the live path; it remains only as the
+    # offline backup / migration source (see DEPLOY.md).
+    embedded = EmbeddedNedbStore(settings.NEDB_EMBEDDED_DIR)
+    await embedded.open()
+    store = EmbeddedStore(embedded)
+    set_store_override(store)
+    set_embedded_store_instance(store)
+    init_address_index_writer(embedded)
+    logger.info("Embedded NEDB store ready at %s", settings.NEDB_EMBEDDED_DIR)
 
     indexer = get_indexer()
     address_indexer = get_address_indexer()
-    lifespan_embedded: list = []
 
     async def _deferred_start():
         """Run after uvicorn is already accepting connections.
@@ -94,55 +97,38 @@ async def lifespan(app: FastAPI):
         await asyncio.sleep(1)  # Let uvicorn settle
         logger.info("Deferred startup: begin")
 
-        # 0. Embedded NEDB store — the KV layer lives in-process now.
-        #    Open it, install it as the get_db() override, seed the tip
-        #    window from SQLite so the explorer serves live data
-        #    immediately, then start the backwards history sync.
-        if settings.STORE_MODE == "embedded":
-            try:
-                sqlite = _get_sqlite_db()   # capture BEFORE override
-                embedded = EmbeddedNedbStore(settings.NEDB_EMBEDDED_DIR)
-                await embedded.open()
-                store = EmbeddedStore(sqlite, embedded)
-                set_store_override(store)
-                set_embedded_store_instance(store)
-                lifespan_embedded.append(embedded)
-
-                seed = await seed_tip_window(sqlite, embedded)
-                # Source order: SQLite first — its KV cache is local,
-                # complete, and holds byte-identical docs. The legacy
-                # nedbd HTTP store is a remote round-trip per block
-                # through a thin connection pool; as primary source it
-                # throttled the descent to ~100 blocks/min in
-                # production. It stays as a fallback, then RPC.
-                sources: list = [SqliteKvBlockSource(sqlite)]
-                if settings.NEDB_URL:
-                    try:
-                        await nedb_store.init_db()
-                        sources.append(HttpKvBlockSource(nedb_store.get_db()))
-                    except Exception as e:
-                        logger.warning(
-                            "Legacy nedbd backfill source unavailable "
-                            "(non-fatal): %s", e,
-                        )
+        # 0. Seed the tip window from the daemon and start the
+        #    backwards history sync into the embedded store. Sources,
+        #    in order: live RPC in the indexer's own lite
+        #    serialization, then the legacy nedbd HTTP store when
+        #    NEDB_URL is set. SQLite is NOT a live source any more.
+        try:
+            from .rpc.client import get_rpc as _get_rpc
+            rpc_client = _get_rpc()
+            seed = await seed_tip_window_from_rpc(embedded, rpc_client)
+            sources: list = [RpcLiteBlockSource(rpc_client)]
+            if settings.NEDB_URL:
                 try:
-                    from .rpc.client import get_rpc as _get_rpc
-                    sources.append(RpcLiteBlockSource(_get_rpc()))
-                except Exception:
-                    pass
-                backfill = EmbeddedBackfillTask(embedded, sources)
-                set_backfill_task(backfill)
-                await backfill.start()
-                logger.info(
-                    "Embedded store ACTIVE — KV in-process at %s "
-                    "(tip=%d, seeded=%d, history sync running)",
-                    settings.NEDB_EMBEDDED_DIR, seed["tip"], seed["seeded"],
-                )
-            except Exception as e:
-                logger.error(
-                    "Embedded store init failed (non-fatal — SQLite "
-                    "keeps serving): %s", e, exc_info=True,
-                )
+                    await nedb_store.init_db()
+                    sources.append(HttpKvBlockSource(nedb_store.get_db()))
+                except Exception as e:
+                    logger.warning(
+                        "Legacy nedbd backfill source unavailable "
+                        "(non-fatal): %s", e,
+                    )
+            backfill = EmbeddedBackfillTask(embedded, sources)
+            set_backfill_task(backfill)
+            await backfill.start()
+            logger.info(
+                "Embedded history sync running — tip=%d seeded=%d "
+                "sources=%s",
+                seed["tip"], seed["seeded"],
+                [s.name for s in sources],
+            )
+        except Exception as e:
+            logger.error(
+                "Embedded seed/backfill failed: %s", e, exc_info=True,
+            )
 
         # 1. ElectrumX first — its handshake is independent of the DB
         try:
@@ -155,15 +141,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("ElectrumX pre-connect failed (non-fatal): %s", e)
 
-        # 2. Open the dedicated address-index writer connection BEFORE any
-        # task that might want to write through it.
-        try:
-            await asyncio.wait_for(init_address_index_writer(), timeout=15)
-            logger.info("Address-index writer ready")
-        except Exception as e:
-            logger.error("init_address_index_writer failed: %s", e, exc_info=True)
-
-        # 3. Warm special wallets (writes to KV via shared connection).
+        # 2. Warm special wallets (writes to KV via the store).
         try:
             await asyncio.wait_for(indexer.warm_special_wallets(), timeout=15)
             logger.info("Special wallets warmed")
@@ -172,14 +150,14 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("warm_special_wallets failed (non-fatal): %s", e)
 
-        # 4. Start the block indexer task.
+        # 3. Start the block indexer task.
         try:
             await indexer.start()
             logger.info("Block indexer task started")
         except Exception as e:
             logger.error("indexer.start failed: %s", e, exc_info=True)
 
-        # 5. Start the address indexer task.
+        # 4. Start the address indexer task.
         try:
             await address_indexer.start()
             logger.info("Address indexer task started")
@@ -220,15 +198,12 @@ async def lifespan(app: FastAPI):
     await close_address_index_writer()
     await close_electrumx()
     await close_rpc()
-    await close_db()
-    if lifespan_embedded:
-        set_store_override(None)
-        set_embedded_store_instance(None)
-        for _emb in lifespan_embedded:
-            try:
-                await _emb.aclose()
-            except Exception as e:
-                logger.warning("embedded store close failed: %s", e)
+    set_store_override(None)
+    set_embedded_store_instance(None)
+    try:
+        await embedded.aclose()
+    except Exception as e:
+        logger.warning("embedded store close failed: %s", e)
     if settings.NEDB_URL:
         try:
             await nedb_store.close_db()

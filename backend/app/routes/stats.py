@@ -332,64 +332,43 @@ def indexer_status():
     the asyncio event loop entirely and always responds even when the
     indexer is saturating it.
 
-    Falls back gracefully through three levels:
-      1. Read the full status JSON from kv.
-      2. If that row can't be read (lock or missing), read just
-         vision:indexer:last_height and synthesise a status — better than
-         lying with phase=starting which keeps the splash up forever.
-      3. If even that fails, return phase=db_locked so the frontend knows
-         this is contention, not a cold start.
+    The indexer writes its status to the embedded NEDB store (the
+    only live store); this endpoint peeks it synchronously, exactly
+    like /api/health. Falls back gracefully through three levels:
+      1. The full status JSON from the embedded KV.
+      2. If that can't be read, just vision:indexer:last_height and
+         a synthesised status — better than lying with
+         phase=starting which keeps the splash up forever.
+      3. If even that fails, phase=db_locked so the frontend knows
+         this is an outage, not a cold start.
     """
-    import sqlite3
-    from ..config import settings
+    from ..embedded_store import get_embedded_store
 
-    db_path = str(settings.SQLITE_DB_PATH)
-
-    def _open():
-        # isolation_level=None  → autocommit; matches sqlite_store.py.
-        # timeout=10  → wait up to 10s on the SQLite busy handler before
-        # giving up (was 2s, which is shorter than a typical indexer
-        # apply_block batch and so produced spurious "starting" responses).
-        c = sqlite3.connect(db_path, timeout=10, isolation_level=None)
-        c.execute("PRAGMA busy_timeout=10000")
-        return c
+    emb = get_embedded_store()
 
     # Level 1 — full status object
     try:
-        conn = _open()
-        try:
-            cur = conn.execute(
-                "SELECT value FROM kv WHERE key = ?", ("vision:indexer:status",)
-            )
-            row = cur.fetchone()
-            if row and row[0]:
-                return json.loads(row[0])
-        finally:
-            conn.close()
+        if emb is not None:
+            raw = emb.peek_kv("vision:indexer:status")
+            if raw:
+                return json.loads(raw)
     except Exception:
         pass
 
     # Level 2 — synthesise from last_height alone
     try:
-        conn = _open()
-        try:
-            cur = conn.execute(
-                "SELECT value FROM kv WHERE key = ?",
-                ("vision:indexer:last_height",),
-            )
-            row = cur.fetchone()
-            if row and row[0]:
-                last_h = int(row[0])
+        if emb is not None:
+            raw = emb.peek_kv("vision:indexer:last_height")
+            if raw:
+                last_h = int(raw)
                 return {
                     "phase": "syncing" if last_h > 0 else "starting",
                     "last_height": last_h,
                     "tip": last_h,
                     "degraded": True,
                 }
-        finally:
-            conn.close()
     except Exception:
         pass
 
-    # Level 3 — DB itself is unreachable / locked
+    # Level 3 — the store itself is unreachable
     return {"phase": "db_locked", "last_height": 0, "tip": 0, "degraded": True}

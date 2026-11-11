@@ -68,21 +68,46 @@ class Settings(BaseSettings):
         except (TypeError, ValueError):
             return None
 
-    # ── SQLite (replaces Redis) ──
+    # ── SQLite (backup / migration source ONLY) ──
+    # The live store is the embedded NEDB engine; SQLITE_DB_PATH now
+    # names only the cold backup file the offline migrators read.
+    # Set DISABLE_SQLITE=1 in production: any attempt to construct
+    # the SQLite store from app code then raises RuntimeError, so a
+    # regression can never silently fall back to the file.
     SQLITE_DB_PATH: str = "../data/vision.db"
+    DISABLE_SQLITE: str = "0"
+
+    @property
+    def sqlite_disabled(self) -> bool:
+        return str(self.DISABLE_SQLITE).strip().lower() in (
+            "1", "true", "yes", "on",
+        )
 
     # ── KV store ──
-    # STORE_MODE "embedded" (default): the KV layer is served by an
-    # in-process embedded NEDB engine on NEDB_EMBEDDED_DIR — no HTTP
-    # hop, no separate nedbd process in the serving path. "sqlite"
-    # keeps the legacy behaviour (KV on SQLiteStore directly).
+    # STORE_MODE accepts exactly one value: "embedded" — the KV and
+    # domain layers are served by an in-process embedded NEDB engine
+    # on NEDB_EMBEDDED_DIR, no HTTP hop, no separate nedbd process,
+    # and no SQLite in the serving path. Any other value fails
+    # startup with a clear error (see the validator below).
     STORE_MODE: str = "embedded"
     NEDB_EMBEDDED_DIR: str = "../data/vision-embedded"
 
+    @field_validator("STORE_MODE", mode="before")
+    @classmethod
+    def _validate_store_mode(cls, v):
+        if str(v).strip().lower() != "embedded":
+            raise ValueError(
+                f"STORE_MODE={v!r} is not supported: the only live "
+                "store is the embedded NEDB engine "
+                "(STORE_MODE=embedded). SQLite is backup / "
+                "migration-source only — see DEPLOY.md."
+            )
+        return "embedded"
+
     # ── NEDB over HTTP (legacy — backfill source only) ──
     # When NEDB_URL is set (e.g. "http://127.0.0.1:7070"), the
-    # one-time backwards history sync prefers copying block KV docs
-    # from the old nedbd store before falling back to SQLite / RPC.
+    # one-time backwards history sync may copy block KV docs
+    # from the old nedbd store as a secondary source (after live RPC).
     # It is never used for serving reads or writes any more.
     NEDB_URL: str = ""
     NEDB_DB_NAME: str = "vision"
