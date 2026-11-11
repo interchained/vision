@@ -162,12 +162,18 @@ def _save_state(path: Path, state: dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def _table_count(conn, table: str) -> int:
+    """Row count for ``table``; -1 ONLY when the table genuinely does
+    not exist in this vintage of vision.db. Any other failure (wrong
+    file, unreadable database, lock, bad URI) raises — a migrator must
+    never disguise a broken source as an empty one."""
     try:
         async with conn.execute(f"SELECT COUNT(*) FROM {table}") as cur:
             row = await cur.fetchone()
         return int(row[0] or 0)
-    except Exception:
-        return -1  # table missing in this vintage of vision.db
+    except Exception as e:
+        if "no such table" in str(e):
+            return -1
+        raise RuntimeError(f"COUNT failed for table {table!r}: {e}") from e
 
 
 async def _migrate_table(conn, store, table, order_by, builder,
@@ -204,7 +210,7 @@ async def _migrate_table(conn, store, table, order_by, builder,
 
 
 async def _run(args) -> int:
-    sqlite_path = Path(args.sqlite)
+    sqlite_path = Path(args.sqlite).resolve()
     if not sqlite_path.exists():
         print(f"ERROR: SQLite not found: {sqlite_path}")
         return 1
@@ -216,22 +222,40 @@ async def _run(args) -> int:
     state = {} if args.dry_run else _load_state(state_file)
 
     print(f"\ndomain-migrator v{__version__} — SQLite → embedded NEDB\n")
-    print(f"  sqlite        {sqlite_path}")
+    print(f"  sqlite        {sqlite_path} "
+          f"({sqlite_path.stat().st_size:,} bytes)")
     print(f"  embedded dir  {embedded_dir}")
     if args.dry_run:
         print("  mode          DRY RUN (no writes)")
 
-    store = None
-    if not args.dry_run:
-        embedded_dir.mkdir(parents=True, exist_ok=True)
-        store = EmbeddedNedbStore(str(embedded_dir))
-        await store.open()
-
-    t0 = time.time()
+    conn = await aiosqlite.connect(f"file:{sqlite_path}?mode=ro",
+                                   uri=True)
+    conn.row_factory = aiosqlite.Row
     try:
-        conn = await aiosqlite.connect(f"file:{sqlite_path}?mode=ro",
-                                       uri=True)
-        conn.row_factory = aiosqlite.Row
+        # Preflight BEFORE the (potentially expensive) embedded open:
+        # prove the source really is a Vision database. If none of the
+        # domain tables exist, this is the wrong file — say so loudly
+        # instead of "migrating" an empty database in 0.1s.
+        async with conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ) as cur:
+            found_tables = {r[0] for r in await cur.fetchall()}
+        expected_tables = {t for t, *_ in TABLES}
+        if not (expected_tables & found_tables):
+            print(f"\nERROR: no Vision domain tables in {sqlite_path}")
+            print(f"  tables present: {sorted(found_tables) or 'none'}")
+            print("  This is not the production vision.db — point "
+                  "--sqlite at the real file (see SQLITE_DB_PATH in "
+                  "the backend .env). Nothing was written.")
+            return 2
+
+        store = None
+        if not args.dry_run:
+            embedded_dir.mkdir(parents=True, exist_ok=True)
+            store = EmbeddedNedbStore(str(embedded_dir))
+            await store.open()
+
+        t0 = time.time()
         try:
             for table, order_by, counter_key, builder in TABLES:
                 await _migrate_table(
@@ -273,10 +297,10 @@ async def _run(args) -> int:
                         if max_id > cur:
                             await store.set(counter_key, str(max_id))
         finally:
-            await conn.close()
+            if store is not None:
+                await store.aclose()
     finally:
-        if store is not None:
-            await store.aclose()
+        await conn.close()
 
     print(f"\nDone in {time.time() - t0:.1f}s. "
           f"{sqlite_path} is untouched and remains the cold backup.")
