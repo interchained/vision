@@ -14,6 +14,12 @@ only a tail in the AOF, so the auto-migrator would silently drop the
 folded state. This converter streams the LIVE state (snapshot + tail,
 composed by the engine itself) and writes it into NedbCore doc by doc.
 
+Substrate: the target is opened with NEDB_DAG_V3=1 (set here if the
+caller didn't), so every object lands in the packed segment store —
+the substrate the portal-mode open (NEDB_PORTAL_READS) serves. Without
+it the v2 store defaults to loose per-object files and there are no
+segments for portals to reference.
+
 Source reads go through Vision's own _BoundedNEDB when --vision-backend
 is given (its offset-indexed snapshot load is what keeps the source open
 bounded on a production-size store); otherwise the stock NEDB class.
@@ -75,13 +81,24 @@ def canon_digest(h, coll, doc_id, body):
     h.update(b"\x01")
 
 
-def page_query(db, coll, last_id, page):
-    if last_id is None:
-        nql = f'FROM {coll} ORDER BY _id LIMIT {page}'
-    else:
-        nql = (f'FROM {coll} WHERE _id > "{nql_escape(last_id)}" '
-               f'ORDER BY _id LIMIT {page}')
-    return db.query(nql)
+def iter_source_docs(db, coll):
+    """Yield (doc_id, doc) for every live doc of one collection, in _id
+    order, in ONE pass over the store.
+
+    The engine's own internal iteration pattern (create_index's backfill
+    does exactly this): list the collection's keys once, then get() each
+    doc. NQL paging is NOT used on the source side — the Python engine
+    answers every query with a full collection scan + sort, so paging
+    through NQL costs a full scan per page (quadratic in collection
+    size), which is untenable on production-size collections.
+    Tombstoned keys surface here but get() returns None for them.
+    """
+    prefix = coll + ":"
+    for key in sorted(db.store.keys(prefix)):
+        doc_id = key[len(prefix):]
+        doc = db.get(coll, doc_id)
+        if doc is not None:
+            yield doc_id, doc
 
 
 def open_source(src, engine, vision_backend):
@@ -130,32 +147,28 @@ def main():
 
     print("== phase 2/4: stream live docs into NedbCore ==", flush=True)
     from nedb._native import NedbCore
+    if os.environ.get("NEDB_DAG_V3") not in ("1", "true", "TRUE"):
+        os.environ["NEDB_DAG_V3"] = "1"
+        print("   substrate: NEDB_DAG_V3=1 (segment store)", flush=True)
     os.makedirs(dst, exist_ok=True)
     core = NedbCore.open(dst)
     counts = {}
     digest = hashlib.sha256()
     total = 0
     for coll in colls:
-        last = None
         n = 0
-        while True:
-            rows = page_query(db, coll, last, args.page)
-            if not rows:
-                break
-            for doc in rows:
-                doc_id, body = clean_body(doc)
-                core.put(coll, str(doc_id),
-                         json.dumps(body, separators=(",", ":")))
-                canon_digest(digest, coll, str(doc_id), body)
-                n += 1
-                last = doc["_id"]
-            total += len(rows)
-            print(f"   [{coll}] {n} docs | total {total} | "
-                  f"{total / max(time.time() - t0, 0.01):.0f} docs/s | "
-                  f"RSS {rss_mb():.0f} MB | elapsed {time.time() - t0:.0f}s",
-                  flush=True)
-            if len(rows) < args.page:
-                break
+        for _key_id, doc in iter_source_docs(db, coll):
+            doc_id, body = clean_body(doc)
+            core.put(coll, str(doc_id),
+                     json.dumps(body, separators=(",", ":")))
+            canon_digest(digest, coll, str(doc_id), body)
+            n += 1
+            total += 1
+            if n % args.page == 0:
+                print(f"   [{coll}] {n} docs | total {total} | "
+                      f"{total / max(time.time() - t0, 0.01):.0f} docs/s | "
+                      f"RSS {rss_mb():.0f} MB | "
+                      f"elapsed {time.time() - t0:.0f}s", flush=True)
         counts[coll] = n
         print(f"   [{coll}] done: {n} live docs", flush=True)
     core.flush()

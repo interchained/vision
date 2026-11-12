@@ -327,6 +327,13 @@ def _native_nedb_class():
 
         def __init__(self, path: str) -> None:
             self._path = path
+            # The v2 store is segment-backed (NEDB_DAG_V3) and opens in
+            # portal mode (NEDB_PORTAL_READS): sealed segments are read
+            # through their on-disk indexes instead of being indexed in
+            # memory. Both default on here; an explicit env value set
+            # before boot is respected.
+            os.environ.setdefault("NEDB_DAG_V3", "1")
+            os.environ.setdefault("NEDB_PORTAL_READS", "1")
             self._core = NedbCore.open(os.path.join(path, "rust"))
             self._colls = set()
             marker = os.path.join(path, "conversion.json")
