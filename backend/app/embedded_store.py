@@ -296,6 +296,90 @@ def _bounded_nedb_class():
     return _bounded_cls
 
 
+_native_cls = None
+
+
+def _native_nedb_class():
+    """NEDB-shaped adapter over the Rust NedbCore (``nedb._native``).
+
+    Selected with NEDB_ENGINE=native. The v2 store lives in the
+    ``rust/`` subdirectory of the embedded data dir; the v1 files
+    (snapshot.json + log.aof) stay untouched beside it as the archive
+    and the rollback path. Only the engine surface the facade and the
+    domain mixin actually call is implemented: put / get / delete /
+    query / create_index / collections / checkpoint / flush / close.
+
+    Conversion from a v1 store is convert_store.py's job (it streams
+    the live state through the bounded reader above and verifies
+    counts + a content digest + verify() before writing
+    conversion.json); this adapter seeds collections() from that
+    marker and tracks new collections as they are written.
+    """
+    global _native_cls
+    if _native_cls is not None:
+        return _native_cls
+
+    from nedb._native import NedbCore
+
+    class _NativeNEDB:
+        _open_info = {"mode": "native-rust"}
+        _is_native = True
+
+        def __init__(self, path: str) -> None:
+            self._path = path
+            self._core = NedbCore.open(os.path.join(path, "rust"))
+            self._colls = set()
+            marker = os.path.join(path, "conversion.json")
+            if os.path.exists(marker):
+                try:
+                    with open(marker, encoding="utf-8") as fh:
+                        self._colls.update(
+                            json.load(fh).get("counts", {}).keys())
+                except Exception:
+                    pass
+
+        # ── engine surface used by the facade / domain mixin ──────
+        def put(self, coll, doc_id, doc):
+            self._colls.add(coll)
+            return self._core.put(coll, str(doc_id), json.dumps(doc))
+
+        def get(self, coll, doc_id):
+            raw = self._core.get(coll, str(doc_id))
+            return json.loads(raw) if raw is not None else None
+
+        def delete(self, coll, doc_id):
+            return self._core.delete(coll, str(doc_id))
+
+        def query(self, nql):
+            return [json.loads(r) for r in self._core.query(nql)]
+
+        def create_index(self, coll, field, kind="eq"):
+            return self._core.create_index(coll, field, kind)
+
+        def collections(self):
+            return sorted(self._colls)
+
+        def checkpoint(self):
+            self._core.flush()
+            return self._core.head()
+
+        def flush(self):
+            return self._core.flush()
+
+        def close(self):
+            try:
+                self._core.flush()
+            except Exception:
+                pass
+
+        @property
+        def seq(self):
+            return self._core.seq()
+
+    _native_cls = _NativeNEDB
+    return _native_cls
+
+
 class EmbeddedNedbStore(EmbeddedDomainMixin):
     """Async facade over the embedded NEDB engine.
 
@@ -360,7 +444,10 @@ class EmbeddedNedbStore(EmbeddedDomainMixin):
             return
 
         def _open():
-            db = _bounded_nedb_class()(self._path)
+            if os.environ.get("NEDB_ENGINE") == "native":
+                db = _native_nedb_class()(self._path)
+            else:
+                db = _bounded_nedb_class()(self._path)
             # Domain-layer indexes: equality lookups on these fields
             # are the hot paths (address pages, snapshot scans).
             # create_index is idempotent and cheap on an indexed
@@ -400,7 +487,13 @@ class EmbeddedNedbStore(EmbeddedDomainMixin):
             if os.environ.get(
                     "VISION_EMBEDDED_CHECKPOINT_ON_CLOSE", "1") != "0":
                 try:
-                    await self._run(checkpoint_embedded_db, db, self._path)
+                    if getattr(db, "_is_native", False):
+                        # The v2 store has no AOF/snapshot to checkpoint;
+                        # a flush is the durable close. The bounded-open
+                        # sidecar is a v1 concept and is not written.
+                        await self._run(db.flush)
+                    else:
+                        await self._run(checkpoint_embedded_db, db, self._path)
                 except Exception as e:
                     logger.warning(
                         "embedded checkpoint on close failed: %s", e)
